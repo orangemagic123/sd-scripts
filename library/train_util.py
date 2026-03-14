@@ -428,6 +428,7 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
+        protected_tags_file: Optional[str],
         caption_prefix: Optional[str],
         caption_suffix: Optional[str],
         token_warmup_min: int,
@@ -453,6 +454,7 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
+        self.protected_tags_file = protected_tags_file
         self.caption_prefix = caption_prefix
         self.caption_suffix = caption_suffix
 
@@ -492,6 +494,7 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        protected_tags_file,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -520,6 +523,7 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            protected_tags_file,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -563,6 +567,7 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        protected_tags_file,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -591,6 +596,7 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            protected_tags_file,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -630,6 +636,7 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        protected_tags_file,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -658,6 +665,7 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            protected_tags_file,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -731,6 +739,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
 
         self.replacements = {}
+        self.protected_tags_cache: Dict[str, set[str]] = {}
+        self.missing_protected_tags_files = set()
 
         # caching
         self.caching_mode = None  # None, 'latents', 'text'
@@ -818,6 +828,28 @@ class BaseDataset(torch.utils.data.Dataset):
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
 
+    def get_protected_tags(self, subset: BaseSubset) -> set[str]:
+        if not hasattr(subset, "protected_tags_file") or not subset.protected_tags_file:
+            return set()
+
+        path = subset.protected_tags_file
+        if path in self.protected_tags_cache:
+            return self.protected_tags_cache[path]
+
+        if not os.path.exists(path):
+            if path not in self.missing_protected_tags_files:
+                logger.warning(f"protected tags file not found: {path}")
+                self.missing_protected_tags_files.add(path)
+            self.protected_tags_cache[path] = set()
+            return self.protected_tags_cache[path]
+
+        with open(path, "r", encoding="utf-8") as f:
+            tags = {line.strip().lower() for line in f.readlines() if line.strip()}
+
+        logger.info(f"loaded {len(tags)} protected tags from {path}")
+        self.protected_tags_cache[path] = tags
+        return tags
+
     def process_caption(self, subset: BaseSubset, caption):
         # caption に prefix/suffix を付ける
         if subset.caption_prefix:
@@ -901,9 +933,12 @@ class BaseDataset(torch.utils.data.Dataset):
                 def dropout_tags(tokens):
                     if subset.caption_tag_dropout_rate <= 0:
                         return tokens
+
+                    protected_tags = self.get_protected_tags(subset)
                     l = []
                     for token in tokens:
-                        if random.random() >= subset.caption_tag_dropout_rate:
+                        normalized = token.strip().lower()
+                        if normalized in protected_tags or random.random() >= subset.caption_tag_dropout_rate:
                             l.append(token)
                     return l
 
@@ -2416,6 +2451,7 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_dropout_rate,
                 subset.caption_dropout_every_n_epochs,
                 subset.caption_tag_dropout_rate,
+                subset.protected_tags_file,
                 subset.caption_prefix,
                 subset.caption_suffix,
                 subset.token_warmup_min,
@@ -4661,6 +4697,12 @@ def add_dataset_arguments(
             type=float,
             default=0.0,
             help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
+        )
+        parser.add_argument(
+            "--protected_tags_file",
+            type=str,
+            default=None,
+            help="text file with one protected tag per line. protected tags are not dropped by caption_tag_dropout_rate",
         )
 
     if support_dreambooth:
