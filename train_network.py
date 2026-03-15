@@ -1165,6 +1165,9 @@ class NetworkTrainer:
             "ss_validate_every_n_epochs": args.validate_every_n_epochs,
             "ss_validate_every_n_steps": args.validate_every_n_steps,
             "ss_resize_interpolation": args.resize_interpolation,
+            "ss_network_ema_decay": args.network_ema_decay,
+            "ss_network_ema_save_weights": bool(args.network_ema_save_weights),
+            "ss_network_ema_apply_for_sampling": bool(args.network_ema_apply_for_sampling),
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
