@@ -53,6 +53,69 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+
+class NetworkEMA:
+    def __init__(self, model: nn.Module, decay: float, device: Optional[torch.device] = None):
+        self.decay = decay
+        self.device = device
+        self.shadow_params = {}
+        self.backup_params = {}
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                shadow = param.detach().clone().float()
+                if self.device is not None:
+                    shadow = shadow.to(self.device)
+                self.shadow_params[name] = shadow
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        one_minus_decay = 1.0 - self.decay
+        for name, param in model.named_parameters():
+            if not param.requires_grad or name not in self.shadow_params:
+                continue
+
+            current = param.detach().float()
+            shadow = self.shadow_params[name]
+            if shadow.device != current.device:
+                current = current.to(shadow.device)
+            shadow.mul_(self.decay).add_(current, alpha=one_minus_decay)
+
+    @torch.no_grad()
+    def apply_to(self, model: nn.Module):
+        self.backup_params = {}
+        for name, param in model.named_parameters():
+            if not param.requires_grad or name not in self.shadow_params:
+                continue
+
+            self.backup_params[name] = param.detach().clone()
+            target = self.shadow_params[name]
+            if target.device != param.device:
+                target = target.to(param.device)
+            param.copy_(target.to(dtype=param.dtype))
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if name not in self.backup_params:
+                continue
+            param.copy_(self.backup_params[name])
+        self.backup_params = {}
+
+    def state_dict(self):
+        return {"decay": self.decay, "shadow_params": self.shadow_params}
+
+    def load_state_dict(self, state_dict):
+        self.decay = state_dict["decay"]
+        loaded_params = state_dict["shadow_params"]
+
+        self.shadow_params = {}
+        for name, tensor in loaded_params.items():
+            if self.device is not None:
+                tensor = tensor.to(self.device)
+            self.shadow_params[name] = tensor
+
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -236,6 +299,29 @@ class NetworkTrainer:
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizers[0], text_encoder, unet)
+
+
+
+    def log_training_captions(self, args, batch, global_step: int):
+        if args.log_captions_every_n_steps is None or args.log_captions_every_n_steps <= 0:
+            return
+        if global_step <= 0 or global_step % args.log_captions_every_n_steps != 0:
+            return
+
+        captions = batch.get("captions", None)
+        if not captions:
+            logger.info(f"step {global_step}: no captions found in this batch")
+            return
+
+        max_items = min(len(captions), args.log_captions_max_per_step)
+        logger.info(f"step {global_step}: training captions (showing {max_items}/{len(captions)})")
+        for i, caption in enumerate(captions[:max_items]):
+            text = "" if caption is None else str(caption)
+            if args.log_captions_max_length is not None and args.log_captions_max_length > 0:
+                tags = [tag.strip() for tag in text.split(",") if tag.strip() != ""]
+                if len(tags) > args.log_captions_max_length:
+                    text = ", ".join(tags[: args.log_captions_max_length]) + ", ..."
+            logger.info(f"  caption[{i}]: {text}")
 
     # region SD/SDXL
 
@@ -926,6 +1012,13 @@ class NetworkTrainer:
         if args.full_fp16:
             train_util.patch_accelerator_for_fp16_training(accelerator)
 
+        network_ema = None
+        if args.network_ema_decay is not None:
+            if not (0.0 < args.network_ema_decay < 1.0):
+                raise ValueError("--network_ema_decay must be in (0, 1)")
+            logger.info(f"enable EMA for network weights: decay={args.network_ema_decay}")
+            network_ema = NetworkEMA(accelerator.unwrap_model(network), args.network_ema_decay)
+
         # before resuming make hook for saving/loading to save/load the network weights only
         def save_model_hook(models, weights, output_dir):
             # pop weights of other models than network to save only network weights
@@ -947,6 +1040,10 @@ class NetworkTrainer:
             with open(train_state_file, "w", encoding="utf-8") as f:
                 json.dump({"current_epoch": current_epoch.value, "current_step": current_step.value + 1}, f)
 
+            if network_ema is not None:
+                ema_file = os.path.join(output_dir, "network_ema.pt")
+                torch.save(network_ema.state_dict(), ema_file)
+
         steps_from_state = None
 
         def load_model_hook(models, input_dir):
@@ -967,6 +1064,12 @@ class NetworkTrainer:
                     data = json.load(f)
                 steps_from_state = data["current_step"]
                 logger.info(f"load train state from {train_state_file}: {data}")
+
+            if network_ema is not None:
+                ema_file = os.path.join(input_dir, "network_ema.pt")
+                if os.path.exists(ema_file):
+                    network_ema.load_state_dict(torch.load(ema_file, map_location="cpu"))
+                    logger.info(f"load ema state from {ema_file}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -1062,6 +1165,9 @@ class NetworkTrainer:
             "ss_validate_every_n_epochs": args.validate_every_n_epochs,
             "ss_validate_every_n_steps": args.validate_every_n_steps,
             "ss_resize_interpolation": args.resize_interpolation,
+            "ss_network_ema_decay": args.network_ema_decay,
+            "ss_network_ema_save_weights": bool(args.network_ema_save_weights),
+            "ss_network_ema_apply_for_sampling": bool(args.network_ema_apply_for_sampling),
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -1306,7 +1412,16 @@ class NetworkTrainer:
             sai_metadata = self.get_sai_model_spec(args)
             metadata_to_save.update(sai_metadata)
 
+            ema_applied = False
+            if args.network_ema_save_weights and network_ema is not None:
+                network_ema.apply_to(unwrapped_nw)
+                ema_applied = True
+
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+
+            if ema_applied:
+                network_ema.restore(unwrapped_nw)
+
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
@@ -1329,7 +1444,11 @@ class NetworkTrainer:
 
         # For --sample_at_first
         optimizer_eval_fn()
+        if args.network_ema_apply_for_sampling and network_ema is not None:
+            network_ema.apply_to(accelerator.unwrap_model(network))
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+        if args.network_ema_apply_for_sampling and network_ema is not None:
+            network_ema.restore(accelerator.unwrap_model(network))
         optimizer_train_fn()
         is_tracking = len(accelerator.trackers) > 0
         if is_tracking:
@@ -1455,6 +1574,8 @@ class NetworkTrainer:
                             network.update_norms()
 
                     optimizer.step()
+                    if network_ema is not None:
+                        network_ema.update(accelerator.unwrap_model(network))
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
@@ -1487,10 +1608,16 @@ class NetworkTrainer:
                     progress_bar.update(1)
                     global_step += 1
 
+                    self.log_training_captions(args, batch, global_step)
+
                     optimizer_eval_fn()
+                    if args.network_ema_apply_for_sampling and network_ema is not None:
+                        network_ema.apply_to(accelerator.unwrap_model(network))
                     self.sample_images(
                         accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
                     )
+                    if args.network_ema_apply_for_sampling and network_ema is not None:
+                        network_ema.restore(accelerator.unwrap_model(network))
                     progress_bar.unpause()
 
                     # 指定ステップごとにモデルを保存
@@ -1704,7 +1831,11 @@ class NetworkTrainer:
                     if args.save_state:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
+            if args.network_ema_apply_for_sampling and network_ema is not None:
+                network_ema.apply_to(accelerator.unwrap_model(network))
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+            if args.network_ema_apply_for_sampling and network_ema is not None:
+                network_ema.restore(accelerator.unwrap_model(network))
             progress_bar.unpause()
             optimizer_train_fn()
 
@@ -1898,6 +2029,40 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Max number of validation dataset items processed. By default, validation will run the entire validation dataset / 処理される検証データセット項目の最大数。デフォルトでは、検証は検証データセット全体を実行します",
+    )
+    parser.add_argument(
+        "--network_ema_decay",
+        type=float,
+        default=None,
+        help="enable EMA for network weights with this decay (e.g. 0.999)",
+    )
+    parser.add_argument(
+        "--network_ema_save_weights",
+        action="store_true",
+        help="save EMA network weights instead of latest training weights",
+    )
+    parser.add_argument(
+        "--network_ema_apply_for_sampling",
+        action="store_true",
+        help="apply EMA network weights for sample image generation during training",
+    )
+    parser.add_argument(
+        "--log_captions_every_n_steps",
+        type=int,
+        default=None,
+        help="log captions used for training every N steps (disabled by default)",
+    )
+    parser.add_argument(
+        "--log_captions_max_per_step",
+        type=int,
+        default=2,
+        help="maximum number of captions to print when caption logging is enabled",
+    )
+    parser.add_argument(
+        "--log_captions_max_length",
+        type=int,
+        default=200,
+        help="maximum number of comma-separated tags per logged caption (set <=0 to disable truncation)",
     )
     return parser
 
