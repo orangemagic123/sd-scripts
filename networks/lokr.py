@@ -242,7 +242,7 @@ class LoKrModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        diff_weight = self.get_diff_weight()
+        diff_weight = self.get_diff_weight().to(x.dtype)
 
         # rank dropout
         if self.rank_dropout is not None and self.training:
@@ -373,7 +373,7 @@ class LoKrInfModule(LoKrModule):
         return weight
 
     def default_forward(self, x):
-        diff_weight = self.get_diff_weight()
+        diff_weight = self.get_diff_weight().to(x.dtype)
         if self.is_conv:
             if self.conv_mode == "1x1":
                 diff_weight = diff_weight.unsqueeze(2).unsqueeze(3)

@@ -1343,10 +1343,8 @@ class Anima(nn.Module):
 
         attn_params = attention.AttentionParams.create_attention_params(self.attn_mode, self.split_attn)
 
-        # Determine whether to use float32 for block computations based on input dtype
-        # (use float32 for better stability when input is float16/bfloat16, and to ensure
-        # autocast handles dtype conversions for LoRA/LoKr layers whose weights may be float32)
-        use_fp32 = x_B_T_H_W_D.dtype in (torch.float16, torch.bfloat16)
+        # Determine whether to use float32 for block computations based on input dtype (use float32 for better stability when input is float16)
+        use_fp32 = x_B_T_H_W_D.dtype == torch.float16
 
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
