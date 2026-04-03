@@ -817,6 +817,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 num_epochs = epoch - self.current_epoch
                 for _ in range(num_epochs):
                     self.current_epoch += 1
+                    self.log_protected_tags(self.current_epoch)
                     self.shuffle_buckets()
                 # self.current_epoch seem to be set to 0 again in the next epoch. it may be caused by skipped_dataloader?
             else:
@@ -868,6 +869,20 @@ class BaseDataset(torch.utils.data.Dataset):
             logger.warning(f"protected tags file not found: {subset.protected_tags_file}")
         self.protected_tags_cache[subset.protected_tags_file] = protected_tags
         return protected_tags
+
+    def log_protected_tags(self, epoch: int):
+        logged_files = set()
+        for subset in self.subsets:
+            if not subset.protected_tags_file:
+                continue
+            if subset.protected_tags_file in logged_files:
+                continue
+            logged_files.add(subset.protected_tags_file)
+
+            protected_tags = sorted(self._get_protected_tags(subset))
+            logger.info(
+                f"[protected tags] epoch={epoch} file={subset.protected_tags_file} tags={protected_tags}"
+            )
 
     def _process_tag_caption(self, subset: BaseSubset, caption: str):
         dropped_tags = []
