@@ -201,6 +201,7 @@ class ImageInfo:
         self.cond_img_path: Optional[str] = None
         self.image: Optional[Image.Image] = None  # optional, original PIL Image
         self.text_encoder_outputs_npz: Optional[str] = None  # filename. set in cache_text_encoder_outputs
+        self.caption_nl: Optional[str] = None
 
         # new
         self.text_encoder_outputs: Optional[List[torch.Tensor]] = None
@@ -428,6 +429,9 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
+        caption_mode: str,
+        mixed_weights: Optional[Dict[str, int]],
+        protected_tags_file: Optional[str],
         caption_prefix: Optional[str],
         caption_suffix: Optional[str],
         token_warmup_min: int,
@@ -453,6 +457,9 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
+        self.caption_mode = caption_mode
+        self.mixed_weights = mixed_weights if mixed_weights is not None else {"tags": 25, "nl": 25, "tags_nl": 25, "nl_tags": 25}
+        self.protected_tags_file = protected_tags_file
         self.caption_prefix = caption_prefix
         self.caption_suffix = caption_suffix
 
@@ -492,6 +499,9 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        caption_mode,
+        mixed_weights,
+        protected_tags_file,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -520,6 +530,9 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            caption_mode,
+            mixed_weights,
+            protected_tags_file,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -563,6 +576,9 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        caption_mode,
+        mixed_weights,
+        protected_tags_file,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -591,6 +607,9 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            caption_mode,
+            mixed_weights,
+            protected_tags_file,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -630,6 +649,9 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        caption_mode,
+        mixed_weights,
+        protected_tags_file,
         caption_prefix,
         caption_suffix,
         token_warmup_min,
@@ -658,6 +680,9 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            caption_mode,
+            mixed_weights,
+            protected_tags_file,
             caption_prefix,
             caption_suffix,
             token_warmup_min,
@@ -734,6 +759,10 @@ class BaseDataset(torch.utils.data.Dataset):
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
 
         self.replacements = {}
+        self.protected_tags_cache: Dict[str, set[str]] = {}
+        self.log_captions_every_n_steps = 0
+        self.log_captions_max_length = 20
+        self._last_caption_log_step = -1
 
         # caching
         self.caching_mode = None  # None, 'latents', 'text'
@@ -788,6 +817,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 num_epochs = epoch - self.current_epoch
                 for _ in range(num_epochs):
                     self.current_epoch += 1
+                    self.log_protected_tags(self.current_epoch)
                     self.shuffle_buckets()
                 # self.current_epoch seem to be set to 0 again in the next epoch. it may be caused by skipped_dataloader?
             else:
@@ -799,6 +829,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def set_max_train_steps(self, max_train_steps):
         self.max_train_steps = max_train_steps
+
+    def set_caption_debug_options(self, every_n_steps: int, max_length: int):
+        self.log_captions_every_n_steps = max(0, every_n_steps)
+        self.log_captions_max_length = max(1, max_length)
 
     def set_tag_frequency(self, dir_name, captions):
         frequency_for_dir = self.tag_frequency.get(dir_name, {})
@@ -821,7 +855,88 @@ class BaseDataset(torch.utils.data.Dataset):
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
 
-    def process_caption(self, subset: BaseSubset, caption):
+    def _get_protected_tags(self, subset: BaseSubset) -> set[str]:
+        if not subset.protected_tags_file:
+            return set()
+        if subset.protected_tags_file in self.protected_tags_cache:
+            return self.protected_tags_cache[subset.protected_tags_file]
+
+        protected_tags = set()
+        try:
+            with open(subset.protected_tags_file, "rt", encoding="utf-8") as f:
+                protected_tags = {line.strip() for line in f.readlines() if line.strip()}
+        except FileNotFoundError:
+            logger.warning(f"protected tags file not found: {subset.protected_tags_file}")
+        self.protected_tags_cache[subset.protected_tags_file] = protected_tags
+        return protected_tags
+
+    def log_protected_tags(self, epoch: int):
+        logged_files = set()
+        for subset in self.subsets:
+            if not subset.protected_tags_file:
+                continue
+            if subset.protected_tags_file in logged_files:
+                continue
+            logged_files.add(subset.protected_tags_file)
+
+            protected_tags = sorted(self._get_protected_tags(subset))
+            logger.info(
+                f"[protected tags] epoch={epoch} file={subset.protected_tags_file} tags={protected_tags}"
+            )
+
+    def _process_tag_caption(self, subset: BaseSubset, caption: str):
+        dropped_tags = []
+        if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
+            fixed_tokens = []
+            flex_tokens = []
+            fixed_suffix_tokens = []
+            if (
+                hasattr(subset, "keep_tokens_separator")
+                and subset.keep_tokens_separator
+                and subset.keep_tokens_separator in caption
+            ):
+                fixed_part, flex_part = caption.split(subset.keep_tokens_separator, 1)
+                if subset.keep_tokens_separator in flex_part:
+                    flex_part, fixed_suffix_part = flex_part.split(subset.keep_tokens_separator, 1)
+                    fixed_suffix_tokens = [t.strip() for t in fixed_suffix_part.split(subset.caption_separator) if t.strip()]
+
+                fixed_tokens = [t.strip() for t in fixed_part.split(subset.caption_separator) if t.strip()]
+                flex_tokens = [t.strip() for t in flex_part.split(subset.caption_separator) if t.strip()]
+            else:
+                tokens = [t.strip() for t in caption.strip().split(subset.caption_separator)]
+                flex_tokens = tokens[:]
+                if subset.keep_tokens > 0:
+                    fixed_tokens = flex_tokens[: subset.keep_tokens]
+                    flex_tokens = tokens[subset.keep_tokens :]
+
+            if subset.token_warmup_step < 1:  # 初回に上書きする
+                subset.token_warmup_step = math.floor(subset.token_warmup_step * self.max_train_steps)
+            if subset.token_warmup_step and self.current_step < subset.token_warmup_step:
+                tokens_len = (
+                    math.floor((self.current_step) * ((len(flex_tokens) - subset.token_warmup_min) / (subset.token_warmup_step)))
+                    + subset.token_warmup_min
+                )
+                flex_tokens = flex_tokens[:tokens_len]
+
+            if subset.shuffle_caption:
+                random.shuffle(flex_tokens)
+
+            if subset.caption_tag_dropout_rate > 0:
+                protected_tags = self._get_protected_tags(subset)
+                kept = []
+                for token in flex_tokens:
+                    if token in protected_tags or random.random() >= subset.caption_tag_dropout_rate:
+                        kept.append(token)
+                    else:
+                        dropped_tags.append(token)
+                flex_tokens = kept
+
+            caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+
+        return caption, dropped_tags
+
+    def process_caption(self, subset: BaseSubset, caption: str, caption_nl: Optional[str] = None):
+        debug_info = {"caption_mode": "tags", "dropped_tags": []}
         # caption に prefix/suffix を付ける
         if subset.caption_prefix:
             caption = subset.caption_prefix + " " + caption
@@ -866,56 +981,38 @@ class BaseDataset(torch.utils.data.Dataset):
             else:
                 # if caption is multiline, use the first line
                 caption = caption.split("\n")[0]
+            tag_caption, dropped_tags = self._process_tag_caption(subset, caption)
+            selected_mode = "tags"
 
-            if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
-                fixed_tokens = []
-                flex_tokens = []
-                fixed_suffix_tokens = []
-                if (
-                    hasattr(subset, "keep_tokens_separator")
-                    and subset.keep_tokens_separator
-                    and subset.keep_tokens_separator in caption
-                ):
-                    fixed_part, flex_part = caption.split(subset.keep_tokens_separator, 1)
-                    if subset.keep_tokens_separator in flex_part:
-                        flex_part, fixed_suffix_part = flex_part.split(subset.keep_tokens_separator, 1)
-                        fixed_suffix_tokens = [t.strip() for t in fixed_suffix_part.split(subset.caption_separator) if t.strip()]
+            if subset.caption_mode == "mixed" and caption_nl is not None:
+                nl_caption = caption_nl.split("\n")[0] if "\n" in caption_nl else caption_nl
+                fixed_prefix = []
+                if subset.keep_tokens_separator and subset.keep_tokens_separator in caption:
+                    fixed_prefix = [t.strip() for t in caption.split(subset.keep_tokens_separator, 1)[0].split(subset.caption_separator) if t.strip()]
 
-                    fixed_tokens = [t.strip() for t in fixed_part.split(subset.caption_separator) if t.strip()]
-                    flex_tokens = [t.strip() for t in flex_part.split(subset.caption_separator) if t.strip()]
-                else:
-                    tokens = [t.strip() for t in caption.strip().split(subset.caption_separator)]
-                    flex_tokens = tokens[:]
-                    if subset.keep_tokens > 0:
-                        fixed_tokens = flex_tokens[: subset.keep_tokens]
-                        flex_tokens = tokens[subset.keep_tokens :]
+                modes = ["tags", "nl", "tags_nl", "nl_tags"]
+                weights = [float(subset.mixed_weights.get(mode, 0)) for mode in modes]
+                if sum(weights) <= 0:
+                    weights = [1.0, 0.0, 0.0, 0.0]
+                selected_mode = random.choices(modes, weights=weights, k=1)[0]
 
-                if subset.token_warmup_step < 1:  # 初回に上書きする
-                    subset.token_warmup_step = math.floor(subset.token_warmup_step * self.max_train_steps)
-                if subset.token_warmup_step and self.current_step < subset.token_warmup_step:
-                    tokens_len = (
-                        math.floor(
-                            (self.current_step) * ((len(flex_tokens) - subset.token_warmup_min) / (subset.token_warmup_step))
-                        )
-                        + subset.token_warmup_min
-                    )
-                    flex_tokens = flex_tokens[:tokens_len]
-
-                def dropout_tags(tokens):
-                    if subset.caption_tag_dropout_rate <= 0:
-                        return tokens
-                    l = []
-                    for token in tokens:
-                        if random.random() >= subset.caption_tag_dropout_rate:
-                            l.append(token)
-                    return l
-
-                if subset.shuffle_caption:
-                    random.shuffle(flex_tokens)
-
-                flex_tokens = dropout_tags(flex_tokens)
-
-                caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+                if selected_mode == "tags":
+                    caption = tag_caption
+                elif selected_mode == "nl":
+                    parts = fixed_prefix + [nl_caption]
+                    caption = ", ".join([p for p in parts if p])
+                elif selected_mode == "tags_nl":
+                    caption = ", ".join([p for p in [tag_caption, nl_caption] if p])
+                elif selected_mode == "nl_tags":
+                    if fixed_prefix:
+                        rest_tags = [p.strip() for p in tag_caption.split(subset.caption_separator) if p.strip()][len(fixed_prefix) :]
+                        caption = ", ".join(fixed_prefix + [nl_caption] + rest_tags)
+                    else:
+                        caption = ", ".join([p for p in [nl_caption, tag_caption] if p])
+                debug_info["caption_mode"] = selected_mode
+            else:
+                caption = tag_caption
+            debug_info["dropped_tags"] = dropped_tags
 
             # process secondary separator
             if subset.secondary_separator:
@@ -931,8 +1028,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         caption = str_to
                 else:
                     caption = caption.replace(str_from, str_to)
-
-        return caption
+        return caption, debug_info
 
     def get_input_ids(self, caption, tokenizer=None):
         if tokenizer is None:
@@ -1111,6 +1207,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     or subset.shuffle_caption
                     or subset.token_warmup_step > 0
                     or subset.caption_tag_dropout_rate > 0
+                    or subset.caption_mode == "mixed"
                 )
                 for subset in self.subsets
             ]
@@ -1719,7 +1816,7 @@ class BaseDataset(torch.utils.data.Dataset):
             text_encoder_outputs_list.append(text_encoder_outputs)
 
             if tokenization_required:
-                caption = self.process_caption(subset, image_info.caption)
+                caption, caption_debug = self.process_caption(subset, image_info.caption, image_info.caption_nl)
                 input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
                 # if self.XTI_layers:
                 #     caption_layer = []
@@ -1749,6 +1846,20 @@ class BaseDataset(torch.utils.data.Dataset):
 
             input_ids_list.append(input_ids)
             captions.append(caption)
+            if self.log_captions_every_n_steps > 0 and self.current_step > 0 and self.current_step % self.log_captions_every_n_steps == 0:
+                tokens = [t.strip() for t in caption.split(subset.caption_separator) if t.strip()]
+                caption_preview = ", ".join(tokens[: self.log_captions_max_length])
+                if len(tokens) > self.log_captions_max_length:
+                    caption_preview += ", ..."
+                if self._last_caption_log_step != self.current_step:
+                    logger.info(f"[caption debug] step={self.current_step}")
+                    self._last_caption_log_step = self.current_step
+                logger.info(
+                    f"[caption debug] mode={caption_debug.get('caption_mode', 'tags')} image={image_key} caption={caption_preview}"
+                )
+                dropped_tags = caption_debug.get("dropped_tags", [])
+                if dropped_tags:
+                    logger.info(f"[caption debug] dropped_tags={dropped_tags[: self.log_captions_max_length]}")
 
         def none_or_stack_elements(tensors_list, converter):
             # [[clip_l, clip_g, t5xxl], [clip_l, clip_g, t5xxl], ...] -> [torch.stack(clip_l), torch.stack(clip_g), torch.stack(t5xxl)]
@@ -1954,15 +2065,7 @@ class DreamBoothDataset(BaseDataset):
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
 
-        def read_caption(img_path, caption_extension, enable_wildcard):
-            # captionの候補ファイル名を作る
-            base_name = os.path.splitext(img_path)[0]
-            base_name_face_det = base_name
-            tokens = base_name.split("_")
-            if len(tokens) >= 5:
-                base_name_face_det = "_".join(tokens[:-4])
-            cap_paths = [base_name + caption_extension, base_name_face_det + caption_extension]
-
+        def read_caption_file(cap_paths, enable_wildcard):
             caption = None
             for cap_path in cap_paths:
                 if os.path.isfile(cap_path):
@@ -1974,11 +2077,26 @@ class DreamBoothDataset(BaseDataset):
                             raise e
                         assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
                         if enable_wildcard:
-                            caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
+                            caption = "\n".join([line.strip() for line in lines if line.strip() != ""])
                         else:
                             caption = lines[0].strip()
                     break
             return caption
+
+        def read_caption(img_path, caption_extension, enable_wildcard, caption_mode):
+            # captionの候補ファイル名を作る
+            base_name = os.path.splitext(img_path)[0]
+            base_name_face_det = base_name
+            tokens = base_name.split("_")
+            if len(tokens) >= 5:
+                base_name_face_det = "_".join(tokens[:-4])
+            cap_paths = [base_name + caption_extension, base_name_face_det + caption_extension]
+            caption_tags = read_caption_file(cap_paths, enable_wildcard)
+            caption_nl = None
+            if caption_mode == "mixed":
+                nl_paths = [base_name + "_nl" + caption_extension, base_name_face_det + "_nl" + caption_extension]
+                caption_nl = read_caption_file(nl_paths, False)
+            return caption_tags, caption_nl
 
         def load_dreambooth_dir(subset: DreamBoothSubset):
             if not os.path.isdir(subset.image_dir):
@@ -2088,28 +2206,39 @@ class DreamBoothDataset(BaseDataset):
             logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
 
             if use_cached_info_for_subset:
-                captions = [metas[img_path]["caption"] for img_path in img_paths]
-                missing_captions = [img_path for img_path, caption in zip(img_paths, captions) if caption is None or caption == ""]
+                if subset.caption_mode == "mixed":
+                    captions = [(metas[img_path].get("caption"), metas[img_path].get("caption_nl")) for img_path in img_paths]
+                    missing_captions = [
+                        img_path for img_path, caption in zip(img_paths, captions) if caption[0] is None or caption[0] == ""
+                    ]
+                else:
+                    captions = [metas[img_path]["caption"] for img_path in img_paths]
+                    missing_captions = [
+                        img_path for img_path, caption in zip(img_paths, captions) if caption is None or caption == ""
+                    ]
             else:
                 # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
                 captions = []
                 missing_captions = []
                 for img_path in tqdm(img_paths, desc="read caption"):
-                    cap_for_img = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
+                    cap_for_img, cap_for_img_nl = read_caption(
+                        img_path, subset.caption_extension, subset.enable_wildcard, subset.caption_mode
+                    )
                     if cap_for_img is None and subset.class_tokens is None:
                         logger.warning(
                             f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
                         )
-                        captions.append("")
+                        captions.append(("", cap_for_img_nl) if subset.caption_mode == "mixed" else "")
                         missing_captions.append(img_path)
                     else:
                         if cap_for_img is None:
-                            captions.append(subset.class_tokens)
+                            captions.append((subset.class_tokens, cap_for_img_nl) if subset.caption_mode == "mixed" else subset.class_tokens)
                             missing_captions.append(img_path)
                         else:
-                            captions.append(cap_for_img)
+                            captions.append((cap_for_img, cap_for_img_nl) if subset.caption_mode == "mixed" else cap_for_img)
 
-            self.set_tag_frequency(os.path.basename(subset.image_dir), captions)  # タグ頻度を記録
+            tag_frequency_captions = [c[0] if isinstance(c, tuple) else c for c in captions]
+            self.set_tag_frequency(os.path.basename(subset.image_dir), tag_frequency_captions)  # タグ頻度を記録
 
             if missing_captions:
                 number_of_missing_captions = len(missing_captions)
@@ -2130,7 +2259,10 @@ class DreamBoothDataset(BaseDataset):
                 sizes = [self.get_image_size(img_path) for img_path in tqdm(img_paths, desc="get image size")]
                 matas = {}
                 for img_path, caption, size in zip(img_paths, captions, sizes):
-                    matas[img_path] = {"caption": caption, "resolution": list(size)}
+                    if isinstance(caption, tuple):
+                        matas[img_path] = {"caption": caption[0], "caption_nl": caption[1], "resolution": list(size)}
+                    else:
+                        matas[img_path] = {"caption": caption, "resolution": list(size)}
                 with open(info_cache_file, "w", encoding="utf-8") as f:
                     json.dump(matas, f, ensure_ascii=False, indent=2)
                 logger.info(f"cache image info done for / 画像情報を出力しました : {info_cache_file}")
@@ -2169,7 +2301,10 @@ class DreamBoothDataset(BaseDataset):
                 num_train_images += num_repeats * len(img_paths)
 
             for img_path, caption, size in zip(img_paths, captions, sizes):
-                info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, img_path, subset.caption_dropout_rate)
+                caption_text = caption[0] if isinstance(caption, tuple) else caption
+                info = ImageInfo(img_path, num_repeats, caption_text, subset.is_reg, img_path, subset.caption_dropout_rate)
+                if isinstance(caption, tuple):
+                    info.caption_nl = caption[1]
                 info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 )
@@ -2738,6 +2873,10 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def set_max_train_steps(self, max_train_steps):
         for dataset in self.datasets:
             dataset.set_max_train_steps(max_train_steps)
+
+    def set_caption_debug_options(self, every_n_steps: int, max_length: int):
+        for dataset in self.datasets:
+            dataset.set_caption_debug_options(every_n_steps, max_length)
 
     def disable_token_padding(self):
         for dataset in self.datasets:
@@ -4549,6 +4688,19 @@ def add_dataset_arguments(
         "--caption_extension", type=str, default=".caption", help="extension of caption files / 読み込むcaptionファイルの拡張子"
     )
     parser.add_argument(
+        "--caption_mode",
+        type=str,
+        default="tags",
+        choices=["tags", "mixed"],
+        help="caption mode: tags (default) or mixed(tags/nl composition) / キャプションモード: tags（デフォルト）またはmixed（タグ/自然言語混合）",
+    )
+    parser.add_argument(
+        "--protected_tags_file",
+        type=str,
+        default=None,
+        help="path to protected tags text file. these tags are not dropped by caption_tag_dropout_rate / caption_tag_dropout_rateでドロップしない保護タグファイル",
+    )
+    parser.add_argument(
         "--caption_extention",
         type=str,
         default=None,
@@ -4612,6 +4764,18 @@ def add_dataset_arguments(
         "--debug_dataset",
         action="store_true",
         help="show images for debugging (do not train) / デバッグ用に学習データを画面表示する（学習は行わない）",
+    )
+    parser.add_argument(
+        "--log_captions_every_n_steps",
+        type=int,
+        default=0,
+        help="log sampled captions every N steps (0 to disable) / Nステップごとにサンプルされたキャプションをログ出力（0で無効）",
+    )
+    parser.add_argument(
+        "--log_captions_max_length",
+        type=int,
+        default=20,
+        help="maximum number of caption tokens to print in caption debug logs / キャプションデバッグログで表示する最大トークン数",
     )
     parser.add_argument(
         "--resolution",
