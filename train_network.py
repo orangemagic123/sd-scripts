@@ -1,3 +1,4 @@
+import contextlib
 import gc
 import copy
 import importlib
@@ -914,6 +915,9 @@ class NetworkTrainer:
         if args.full_fp16:
             train_util.patch_accelerator_for_fp16_training(accelerator)
 
+        # mutable reference for EMA network, used in save hook (set later when EMA is created)
+        ema_network_ref = [None]
+
         # before resuming make hook for saving/loading to save/load the network weights only
         def save_model_hook(models, weights, output_dir):
             # pop weights of other models than network to save only network weights
@@ -934,6 +938,12 @@ class NetworkTrainer:
             logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
             with open(train_state_file, "w", encoding="utf-8") as f:
                 json.dump({"current_epoch": current_epoch.value, "current_step": current_step.value + 1}, f)
+
+            # save EMA state if enabled
+            if ema_network_ref[0] is not None:
+                ema_state_file = os.path.join(output_dir, "ema_state.pt")
+                logger.info(f"save EMA state to {ema_state_file}")
+                torch.save(ema_network_ref[0].state_dict(), ema_state_file)
 
         steps_from_state = None
 
@@ -1050,6 +1060,7 @@ class NetworkTrainer:
             "ss_validate_every_n_epochs": args.validate_every_n_epochs,
             "ss_validate_every_n_steps": args.validate_every_n_steps,
             "ss_resize_interpolation": args.resize_interpolation,
+            "ss_ema_decay": args.ema_decay,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -1289,6 +1300,40 @@ class NetworkTrainer:
             ema_network = copy.deepcopy(accelerator.unwrap_model(network))
             ema_network.requires_grad_(False)
             ema_network.eval()
+            ema_network_ref[0] = ema_network
+
+            # restore EMA state if resuming from a checkpoint
+            if args.resume:
+                resume_ema_path = os.path.join(args.resume, "ema_state.pt")
+                if os.path.exists(resume_ema_path):
+                    logger.info(f"loading EMA state from {resume_ema_path}")
+                    ema_state = torch.load(resume_ema_path, map_location="cpu")
+                    ema_network.load_state_dict(ema_state)
+                    del ema_state
+                    logger.info("EMA state loaded successfully")
+                else:
+                    logger.warning(
+                        f"EMA state not found at {resume_ema_path}, starting EMA from current network weights"
+                    )
+
+        @contextlib.contextmanager
+        def ema_scope(network_to_swap, ema_net):
+            """Temporarily replace network weights with EMA weights for validation/sampling."""
+            if ema_net is None:
+                yield
+                return
+            # save current params and swap in EMA params
+            original_params = {}
+            ema_params = dict(ema_net.named_parameters())
+            for name, param in network_to_swap.named_parameters():
+                original_params[name] = param.data.clone()
+                param.data.copy_(ema_params[name].data)
+            try:
+                yield
+            finally:
+                # restore original params
+                for name, param in network_to_swap.named_parameters():
+                    param.data.copy_(original_params[name])
 
         def update_ema_model(ema_model, src_model, decay: float):
             with torch.no_grad():
@@ -1497,9 +1542,10 @@ class NetworkTrainer:
                     global_step += 1
 
                     optimizer_eval_fn()
-                    self.sample_images(
-                        accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
-                    )
+                    with ema_scope(accelerator.unwrap_model(network), ema_network):
+                        self.sample_images(
+                            accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
+                        )
                     progress_bar.unpause()
 
                     # 指定ステップごとにモデルを保存
@@ -1546,24 +1592,106 @@ class NetworkTrainer:
                 should_validate_step = args.validate_every_n_steps is not None and global_step % args.validate_every_n_steps == 0
                 if accelerator.sync_gradients and validation_steps > 0 and should_validate_step:
                     optimizer_eval_fn()
-                    accelerator.unwrap_model(network).eval()
+                    unwrapped_nw = accelerator.unwrap_model(network)
+                    unwrapped_nw.eval()
                     rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
 
+                    with ema_scope(unwrapped_nw, ema_network):
+                        val_progress_bar = tqdm(
+                            range(validation_total_steps),
+                            smoothing=0,
+                            disable=not accelerator.is_local_main_process,
+                            desc="validation steps",
+                        )
+                        val_timesteps_step = 0
+                        for val_step, batch in enumerate(val_dataloader):
+                            if val_step >= validation_steps:
+                                break
+
+                            for timestep in validation_timesteps:
+                                self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
+
+                                args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
+
+                                loss = self.process_batch(
+                                    batch,
+                                    text_encoders,
+                                    unet,
+                                    network,
+                                    vae,
+                                    noise_scheduler,
+                                    vae_dtype,
+                                    weight_dtype,
+                                    accelerator,
+                                    args,
+                                    text_encoding_strategy,
+                                    tokenize_strategy,
+                                    is_train=False,
+                                    train_text_encoder=train_text_encoder,  # this is needed for validation because Text Encoders must be called if train_text_encoder is True
+                                    train_unet=train_unet,
+                                )
+
+                                current_loss = loss.detach().item()
+                                val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
+                                val_progress_bar.update(1)
+                                val_progress_bar.set_postfix(
+                                    {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
+                                )
+
+                                # if is_tracking:
+                                #     logs = {f"loss/validation/step_current_{timestep}": current_loss}
+                                #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
+
+                                self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                                val_timesteps_step += 1
+
+                        if is_tracking:
+                            loss_validation_divergence = val_step_loss_recorder.moving_average - loss_recorder.moving_average
+                            logs = {
+                                "loss/validation/step_average": val_step_loss_recorder.moving_average,
+                                "loss/validation/step_divergence": loss_validation_divergence,
+                            }
+                            self.step_logging(accelerator, logs, global_step, epoch=epoch + 1)
+
+                    restore_rng_state(rng_states)
+                    args.min_timestep = original_args_min_timestep
+                    args.max_timestep = original_args_max_timestep
+                    optimizer_train_fn()
+                    unwrapped_nw.train()
+                    progress_bar.unpause()
+
+                if global_step >= args.max_train_steps:
+                    break
+
+            # EPOCH VALIDATION
+            should_validate_epoch = (
+                (epoch + 1) % args.validate_every_n_epochs == 0 if args.validate_every_n_epochs is not None else True
+            )
+
+            if should_validate_epoch and len(val_dataloader) > 0:
+                optimizer_eval_fn()
+                unwrapped_nw = accelerator.unwrap_model(network)
+                unwrapped_nw.eval()
+                rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
+
+                with ema_scope(unwrapped_nw, ema_network):
                     val_progress_bar = tqdm(
                         range(validation_total_steps),
                         smoothing=0,
                         disable=not accelerator.is_local_main_process,
-                        desc="validation steps",
+                        desc="epoch validation steps",
                     )
+
                     val_timesteps_step = 0
                     for val_step, batch in enumerate(val_dataloader):
                         if val_step >= validation_steps:
                             break
 
                         for timestep in validation_timesteps:
-                            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
+                            args.min_timestep = args.max_timestep = timestep
 
-                            args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
+                            # temporary, for batch processing
+                            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
                             loss = self.process_batch(
                                 batch,
@@ -1579,116 +1707,38 @@ class NetworkTrainer:
                                 text_encoding_strategy,
                                 tokenize_strategy,
                                 is_train=False,
-                                train_text_encoder=train_text_encoder,  # this is needed for validation because Text Encoders must be called if train_text_encoder is True
+                                train_text_encoder=train_text_encoder,
                                 train_unet=train_unet,
                             )
 
                             current_loss = loss.detach().item()
-                            val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
+                            val_epoch_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
                             val_progress_bar.update(1)
                             val_progress_bar.set_postfix(
-                                {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
+                                {"val_epoch_avg_loss": val_epoch_loss_recorder.moving_average, "timestep": timestep}
                             )
 
                             # if is_tracking:
-                            #     logs = {f"loss/validation/step_current_{timestep}": current_loss}
+                            #     logs = {f"loss/validation/epoch_current_{timestep}": current_loss}
                             #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
 
                             self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
                             val_timesteps_step += 1
 
                     if is_tracking:
-                        loss_validation_divergence = val_step_loss_recorder.moving_average - loss_recorder.moving_average
+                        avr_loss: float = val_epoch_loss_recorder.moving_average
+                        loss_validation_divergence = val_epoch_loss_recorder.moving_average - loss_recorder.moving_average
                         logs = {
-                            "loss/validation/step_average": val_step_loss_recorder.moving_average,
-                            "loss/validation/step_divergence": loss_validation_divergence,
+                            "loss/validation/epoch_average": avr_loss,
+                            "loss/validation/epoch_divergence": loss_validation_divergence,
                         }
-                        self.step_logging(accelerator, logs, global_step, epoch=epoch + 1)
-
-                    restore_rng_state(rng_states)
-                    args.min_timestep = original_args_min_timestep
-                    args.max_timestep = original_args_max_timestep
-                    optimizer_train_fn()
-                    accelerator.unwrap_model(network).train()
-                    progress_bar.unpause()
-
-                if global_step >= args.max_train_steps:
-                    break
-
-            # EPOCH VALIDATION
-            should_validate_epoch = (
-                (epoch + 1) % args.validate_every_n_epochs == 0 if args.validate_every_n_epochs is not None else True
-            )
-
-            if should_validate_epoch and len(val_dataloader) > 0:
-                optimizer_eval_fn()
-                accelerator.unwrap_model(network).eval()
-                rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
-
-                val_progress_bar = tqdm(
-                    range(validation_total_steps),
-                    smoothing=0,
-                    disable=not accelerator.is_local_main_process,
-                    desc="epoch validation steps",
-                )
-
-                val_timesteps_step = 0
-                for val_step, batch in enumerate(val_dataloader):
-                    if val_step >= validation_steps:
-                        break
-
-                    for timestep in validation_timesteps:
-                        args.min_timestep = args.max_timestep = timestep
-
-                        # temporary, for batch processing
-                        self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
-
-                        loss = self.process_batch(
-                            batch,
-                            text_encoders,
-                            unet,
-                            network,
-                            vae,
-                            noise_scheduler,
-                            vae_dtype,
-                            weight_dtype,
-                            accelerator,
-                            args,
-                            text_encoding_strategy,
-                            tokenize_strategy,
-                            is_train=False,
-                            train_text_encoder=train_text_encoder,
-                            train_unet=train_unet,
-                        )
-
-                        current_loss = loss.detach().item()
-                        val_epoch_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                        val_progress_bar.update(1)
-                        val_progress_bar.set_postfix(
-                            {"val_epoch_avg_loss": val_epoch_loss_recorder.moving_average, "timestep": timestep}
-                        )
-
-                        # if is_tracking:
-                        #     logs = {f"loss/validation/epoch_current_{timestep}": current_loss}
-                        #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
-
-                        self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
-                        val_timesteps_step += 1
-
-                if is_tracking:
-                    avr_loss: float = val_epoch_loss_recorder.moving_average
-                    loss_validation_divergence = val_epoch_loss_recorder.moving_average - loss_recorder.moving_average
-                    logs = {
-                        "loss/validation/epoch_average": avr_loss,
-                        "loss/validation/epoch_divergence": loss_validation_divergence,
-                    }
-                    self.epoch_logging(accelerator, logs, global_step, epoch + 1)
+                        self.epoch_logging(accelerator, logs, global_step, epoch + 1)
 
                 restore_rng_state(rng_states)
                 args.min_timestep = original_args_min_timestep
                 args.max_timestep = original_args_max_timestep
                 optimizer_train_fn()
-                accelerator.unwrap_model(network).train()
+                unwrapped_nw.train()
                 progress_bar.unpause()
 
             # END OF EPOCH
@@ -1715,7 +1765,8 @@ class NetworkTrainer:
                     if args.save_state:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
-            self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+            with ema_scope(accelerator.unwrap_model(network), ema_network):
+                self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
             progress_bar.unpause()
             optimizer_train_fn()
 
