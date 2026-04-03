@@ -936,7 +936,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         dropped_tags.append(token)
                 flex_tokens = kept
 
-            caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+            caption = subset.caption_separator.join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
 
         return caption, dropped_tags
 
@@ -952,8 +952,8 @@ class BaseDataset(torch.utils.data.Dataset):
         is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
         is_drop_out = (
             is_drop_out
-            or subset.caption_dropout_every_n_epochs > 0
-            and self.current_epoch % subset.caption_dropout_every_n_epochs == 0
+            or (subset.caption_dropout_every_n_epochs > 0
+                and self.current_epoch % subset.caption_dropout_every_n_epochs == 0)
         )
 
         if is_drop_out:
@@ -989,7 +989,7 @@ class BaseDataset(torch.utils.data.Dataset):
             tag_caption, dropped_tags = self._process_tag_caption(subset, caption)
             selected_mode = "tags"
 
-            if subset.caption_mode == "mixed" and caption_nl is not None:
+            if subset.caption_mode == "mixed" and caption_nl:
                 nl_caption = caption_nl.split("\n")[0] if "\n" in caption_nl else caption_nl
                 fixed_prefix = []
                 if subset.keep_tokens_separator and subset.keep_tokens_separator in caption:
@@ -2117,7 +2117,7 @@ class DreamBoothDataset(BaseDataset):
                 if not os.path.isfile(info_cache_file):
                     logger.warning(
                         f"image info file not found. You can ignore this warning if this is the first time to use this subset"
-                        + " / キャッシュファイルが見つかりませんでした。初回実行時はこの警告を無視してください: {metadata_file}"
+                        + f" / キャッシュファイルが見つかりませんでした。初回実行時はこの警告を無視してください: {info_cache_file}"
                     )
                     use_cached_info_for_subset = False
 
@@ -2217,7 +2217,7 @@ class DreamBoothDataset(BaseDataset):
                         img_path for img_path, caption in zip(img_paths, captions) if caption[0] is None or caption[0] == ""
                     ]
                 else:
-                    captions = [metas[img_path]["caption"] for img_path in img_paths]
+                    captions = [metas[img_path].get("caption") for img_path in img_paths]
                     missing_captions = [
                         img_path for img_path, caption in zip(img_paths, captions) if caption is None or caption == ""
                     ]
