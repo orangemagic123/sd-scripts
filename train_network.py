@@ -1294,6 +1294,8 @@ class NetworkTrainer:
             on_step_start_for_network = lambda *args, **kwargs: None
 
         ema_decay = args.ema_decay if args.ema_decay is not None and args.ema_decay > 0 else None
+        if ema_decay is not None and ema_decay >= 1.0:
+            raise ValueError(f"ema_decay must be less than 1.0, got {ema_decay}")
         ema_network = None
         if ema_decay is not None:
             logger.info(f"EMA is enabled. decay={ema_decay}")
