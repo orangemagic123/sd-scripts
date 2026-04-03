@@ -253,9 +253,11 @@ class AdditionalNetwork(torch.nn.Module):
                 else:
                     te_prefix = arch_config.te_prefixes[0]
 
-                logger.info(f"create {module_class.__name__} for Text Encoder {i+1} (prefix={te_prefix}):")
+                if verbose:
+                    logger.info(f"create {module_class.__name__} for Text Encoder {i+1} (prefix={te_prefix}):")
                 te_loras, te_skipped = create_modules(te_prefix, text_encoder, arch_config.te_target_modules)
-                logger.info(f"create {module_class.__name__} for Text Encoder {i+1}: {len(te_loras)} modules.")
+                if verbose:
+                    logger.info(f"create {module_class.__name__} for Text Encoder {i+1}: {len(te_loras)} modules.")
                 self.text_encoder_loras.extend(te_loras)
                 skipped_te += te_skipped
 
@@ -268,7 +270,8 @@ class AdditionalNetwork(torch.nn.Module):
 
         self.unet_loras: List[torch.nn.Module]
         self.unet_loras, skipped_un = create_modules(arch_config.unet_prefix, unet, target_modules)
-        logger.info(f"create {module_class.__name__} for UNet/DiT: {len(self.unet_loras)} modules.")
+        if verbose:
+            logger.info(f"create {module_class.__name__} for UNet/DiT: {len(self.unet_loras)} modules.")
 
         if verbose:
             for lora in self.unet_loras:
