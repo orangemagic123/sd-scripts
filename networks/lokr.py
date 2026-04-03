@@ -79,6 +79,24 @@ def rebuild_tucker(t, wa, wb):
 class LoKrModule(torch.nn.Module):
     """LoKr module for training. Replaces forward method of the original Linear/Conv2d."""
 
+    # Class-level collection for full matrix mode warnings (to avoid spamming hundreds of lines)
+    _full_matrix_warnings: list = []
+
+    @classmethod
+    def flush_full_matrix_warnings(cls):
+        """Log a summary of full matrix mode warnings instead of one per module."""
+        if not cls._full_matrix_warnings:
+            return
+        count = len(cls._full_matrix_warnings)
+        max_entry = max(cls._full_matrix_warnings, key=lambda x: x[0])
+        max_dim, lora_dim, factor, mode = max_entry
+        logger.warning(
+            f"LoKr: {count} module(s) fell back to full matrix mode because lora_dim is large relative to the factorized dim. "
+            f"Largest: dim={max_dim}, lora_dim={lora_dim}, factor={factor} ({mode}). "
+            f"Consider using a smaller lora_dim or different factor."
+        )
+        cls._full_matrix_warnings.clear()
+
     def __init__(
         self,
         lora_name,
@@ -147,9 +165,8 @@ class LoKrModule(torch.nn.Module):
                 # Full matrix mode (includes kernel dimensions)
                 self.use_w2 = True
                 self.lokr_w2 = nn.Parameter(torch.empty(out_k, in_n, *k_size))
-                logger.warning(
-                    f"LoKr: lora_dim {lora_dim} is large for dim={max(in_dim, out_dim)} "
-                    f"and factor={factor}, using full matrix mode for Conv2d."
+                LoKrModule._full_matrix_warnings.append(
+                    (max(in_dim, out_dim), lora_dim, factor, "Conv2d")
                 )
             elif self.tucker:
                 # Tucker mode: separate kernel into t2 tensor
@@ -172,9 +189,8 @@ class LoKrModule(torch.nn.Module):
                 self.use_w2 = True
                 self.lokr_w2 = nn.Parameter(torch.empty(out_k, in_n))
                 if lora_dim >= max(out_k, in_n) / 2:
-                    logger.warning(
-                        f"LoKr: lora_dim {lora_dim} is large for dim={max(in_dim, out_dim)} "
-                        f"and factor={factor}, using full matrix mode."
+                    LoKrModule._full_matrix_warnings.append(
+                        (max(in_dim, out_dim), lora_dim, factor, "Linear")
                     )
 
         if type(alpha) == torch.Tensor:
@@ -495,6 +511,9 @@ def create_network(
         reg_lrs=reg_lrs,
         verbose=verbose,
     )
+
+    # Flush accumulated full matrix mode warnings as a single summary
+    LoKrModule.flush_full_matrix_warnings()
 
     # LoRA+ support
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
