@@ -814,9 +814,14 @@ class BaseDataset(torch.utils.data.Dataset):
         if not self.current_epoch == epoch:  # epochが切り替わったらバケツをシャッフルする
             if epoch > self.current_epoch:
                 logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
-                num_epochs = epoch - self.current_epoch
-                for _ in range(num_epochs):
-                    self.current_epoch += 1
+                if epoch - self.current_epoch > 1:
+                    # worker process may be initialized with current_epoch=0 and then receive a later epoch directly.
+                    # backfilling all intermediate epochs causes noisy logs and unnecessary repeated shuffles.
+                    self.current_epoch = epoch
+                    self.log_protected_tags(self.current_epoch)
+                    self.shuffle_buckets()
+                else:
+                    self.current_epoch = epoch
                     self.log_protected_tags(self.current_epoch)
                     self.shuffle_buckets()
                 # self.current_epoch seem to be set to 0 again in the next epoch. it may be caused by skipped_dataloader?
