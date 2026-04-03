@@ -1,4 +1,5 @@
 import gc
+import copy
 import importlib
 import argparse
 import math
@@ -544,6 +545,10 @@ class NetworkTrainer:
 
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
+        if hasattr(train_dataset_group, "set_caption_debug_options"):
+            train_dataset_group.set_caption_debug_options(args.log_captions_every_n_steps, args.log_captions_max_length)
+        if val_dataset_group is not None and hasattr(val_dataset_group, "set_caption_debug_options"):
+            val_dataset_group.set_caption_debug_options(args.log_captions_every_n_steps, args.log_captions_max_length)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
         collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
 
@@ -1277,6 +1282,23 @@ class NetworkTrainer:
         else:
             on_step_start_for_network = lambda *args, **kwargs: None
 
+        ema_decay = args.ema_decay if args.ema_decay is not None and args.ema_decay > 0 else None
+        ema_network = None
+        if ema_decay is not None:
+            logger.info(f"EMA is enabled. decay={ema_decay}")
+            ema_network = copy.deepcopy(accelerator.unwrap_model(network))
+            ema_network.requires_grad_(False)
+            ema_network.eval()
+
+        def update_ema_model(ema_model, src_model, decay: float):
+            with torch.no_grad():
+                ema_params = dict(ema_model.named_parameters())
+                for name, param in src_model.named_parameters():
+                    ema_params[name].mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+                ema_buffers = dict(ema_model.named_buffers())
+                for name, buf in src_model.named_buffers():
+                    ema_buffers[name].copy_(buf)
+
         # function for saving/removing
         def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
@@ -1469,6 +1491,8 @@ class NetworkTrainer:
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
+                    if ema_network is not None:
+                        update_ema_model(ema_network, accelerator.unwrap_model(network), ema_decay)
                     progress_bar.update(1)
                     global_step += 1
 
@@ -1483,7 +1507,8 @@ class NetworkTrainer:
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
                             ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
-                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+                            save_target = ema_network if ema_network is not None else accelerator.unwrap_model(network)
+                            save_model(ckpt_name, save_target, global_step, epoch)
 
                             if args.save_state:
                                 train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
@@ -1679,7 +1704,8 @@ class NetworkTrainer:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if is_main_process and saving:
                     ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
-                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
+                    save_target = ema_network if ema_network is not None else accelerator.unwrap_model(network)
+                    save_model(ckpt_name, save_target, global_step, epoch + 1)
 
                     remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
                     if remove_epoch_no is not None:
@@ -1709,7 +1735,8 @@ class NetworkTrainer:
 
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
-            save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+            save_target = ema_network if ema_network is not None else network
+            save_model(ckpt_name, save_target, global_step, num_train_epochs, force_sync_upload=True)
 
             logger.info("model saved.")
 
@@ -1783,6 +1810,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Drops neurons out of training every step (0 or None is default behavior (no dropout), 1 would drop all neurons) / 訓練時に毎ステップでニューロンをdropする（0またはNoneはdropoutなし、1は全ニューロンをdropout）",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=None,
+        help="enable EMA for network weights when set (e.g. 0.999) / 指定時にネットワーク重みのEMAを有効化（例: 0.999）",
     )
     parser.add_argument(
         "--network_args",
