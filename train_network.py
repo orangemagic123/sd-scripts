@@ -1307,7 +1307,7 @@ class NetworkTrainer:
                 resume_ema_path = os.path.join(args.resume, "ema_state.pt")
                 if os.path.exists(resume_ema_path):
                     logger.info(f"loading EMA state from {resume_ema_path}")
-                    ema_state = torch.load(resume_ema_path, map_location="cpu")
+                    ema_state = torch.load(resume_ema_path, map_location=accelerator.device)
                     ema_network.load_state_dict(ema_state)
                     del ema_state
                     logger.info("EMA state loaded successfully")

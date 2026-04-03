@@ -256,7 +256,7 @@ def train(args):
         clip_g.requires_grad_(train_clip)
         t5xxl.requires_grad_(train_t5xxl)
     else:
-        print("disable text encoder training")
+        accelerator.print("disable text encoder training")
         clip_l.to(weight_dtype)
         clip_g.to(weight_dtype)
         t5xxl.to(weight_dtype)
@@ -816,15 +816,18 @@ def train(args):
                 )
 
                 # debug: NaN check for all inputs
+                nan_detected = False
                 if torch.any(torch.isnan(noisy_model_input)):
-                    accelerator.print("NaN found in noisy_model_input, replacing with zeros")
-                    noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
+                    accelerator.print("NaN found in noisy_model_input, skipping this batch")
+                    nan_detected = True
                 if torch.any(torch.isnan(context)):
-                    accelerator.print("NaN found in context, replacing with zeros")
-                    context = torch.nan_to_num(context, 0, out=context)
+                    accelerator.print("NaN found in context, skipping this batch")
+                    nan_detected = True
                 if torch.any(torch.isnan(lg_pooled)):
-                    accelerator.print("NaN found in pool, replacing with zeros")
-                    lg_pooled = torch.nan_to_num(lg_pooled, 0, out=lg_pooled)
+                    accelerator.print("NaN found in lg_pooled, skipping this batch")
+                    nan_detected = True
+                if nan_detected:
+                    continue
 
                 # call model
                 with accelerator.autocast():
