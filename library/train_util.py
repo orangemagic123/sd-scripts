@@ -762,7 +762,6 @@ class BaseDataset(torch.utils.data.Dataset):
         self.protected_tags_cache: Dict[str, set[str]] = {}
         self.log_captions_every_n_steps = 0
         self.log_captions_max_length = 20
-        self._last_caption_log_step = -1
 
         # caching
         self.caching_mode = None  # None, 'latents', 'text'
@@ -1681,6 +1680,7 @@ class BaseDataset(torch.utils.data.Dataset):
         flippeds = []  # 変数名が微妙
         text_encoder_outputs_list = []
         custom_attributes = []
+        caption_debug_entries = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
@@ -1851,20 +1851,18 @@ class BaseDataset(torch.utils.data.Dataset):
 
             input_ids_list.append(input_ids)
             captions.append(caption)
-            if self.log_captions_every_n_steps > 0 and self.current_step > 0 and self.current_step % self.log_captions_every_n_steps == 0:
+            if self.log_captions_every_n_steps > 0 and tokenization_required:
                 tokens = [t.strip() for t in caption.split(subset.caption_separator) if t.strip()]
                 caption_preview = ", ".join(tokens[: self.log_captions_max_length])
                 if len(tokens) > self.log_captions_max_length:
                     caption_preview += ", ..."
-                if self._last_caption_log_step != self.current_step:
-                    logger.info(f"[caption debug] step={self.current_step}")
-                    self._last_caption_log_step = self.current_step
-                logger.info(
-                    f"[caption debug] mode={caption_debug.get('caption_mode', 'tags')} image={image_key} caption={caption_preview}"
-                )
-                dropped_tags = caption_debug.get("dropped_tags", [])
-                if dropped_tags:
-                    logger.info(f"[caption debug] dropped_tags={dropped_tags[: self.log_captions_max_length]}")
+                debug_entry = {
+                    "image_key": image_key,
+                    "caption_mode": caption_debug.get("caption_mode", "tags"),
+                    "caption_preview": caption_preview,
+                    "dropped_tags": caption_debug.get("dropped_tags", [])[:self.log_captions_max_length],
+                }
+                caption_debug_entries.append(debug_entry)
 
         def none_or_stack_elements(tensors_list, converter):
             # [[clip_l, clip_g, t5xxl], [clip_l, clip_g, t5xxl], ...] -> [torch.stack(clip_l), torch.stack(clip_g), torch.stack(t5xxl)]
@@ -1940,6 +1938,9 @@ class BaseDataset(torch.utils.data.Dataset):
         example["flippeds"] = flippeds
 
         example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
+
+        if caption_debug_entries:
+            example["caption_debug_entries"] = caption_debug_entries
 
         if self.debug_dataset:
             example["image_keys"] = bucket[image_index : image_index + self.batch_size]

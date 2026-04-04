@@ -1472,6 +1472,22 @@ class NetworkTrainer:
                     initial_step -= 1
                     continue
 
+                # log caption debug info at the correct global_step
+                if (
+                    args.log_captions_every_n_steps
+                    and args.log_captions_every_n_steps > 0
+                    and global_step > 0
+                    and global_step % args.log_captions_every_n_steps == 0
+                    and "caption_debug_entries" in batch
+                ):
+                    logger.info(f"[caption debug] step={global_step}")
+                    for entry in batch["caption_debug_entries"]:
+                        logger.info(
+                            f"[caption debug] mode={entry['caption_mode']} image={entry['image_key']} caption={entry['caption_preview']}"
+                        )
+                        if entry["dropped_tags"]:
+                            logger.info(f"[caption debug] dropped_tags={entry['dropped_tags']}")
+
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
