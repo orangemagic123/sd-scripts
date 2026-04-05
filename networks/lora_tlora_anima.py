@@ -214,16 +214,22 @@ class OrthogonalTLoRAModule(torch.nn.Module):
         self.p_layer = torch.nn.Linear(lora_dim, out_dim, bias=False)
         self.lambda_layer = torch.nn.Parameter(torch.ones(1, lora_dim))
 
-        # SVD initialization
+        # SVD initialization - run on GPU if available for speed
+        svd_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         if use_original_weight:
             if self.is_conv2d:
-                base_m = weight_2d.float()
+                base_m = weight_2d.float().to(svd_device)
             else:
-                base_m = org_module.weight.data.float()
+                base_m = org_module.weight.data.float().to(svd_device)
             u, s, v = torch.linalg.svd(base_m, full_matrices=False)
         else:
-            base_m = torch.normal(mean=0, std=1.0 / lora_dim, size=(effective_in_dim, out_dim))
+            base_m = torch.normal(mean=0, std=1.0 / lora_dim, size=(effective_in_dim, out_dim), device=svd_device)
             u, s, v = torch.linalg.svd(base_m, full_matrices=False)
+
+        # Move SVD results to CPU for storage
+        u = u.cpu()
+        s = s.cpu()
+        v = v.cpu()
 
         if sig_type == "principal":
             self.q_layer.weight.data = v[:lora_dim].clone()
