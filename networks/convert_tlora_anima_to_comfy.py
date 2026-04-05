@@ -152,29 +152,42 @@ def rename_sd_scripts_key_to_comfy(sd_scripts_key: str) -> str:
 
     original_module_name = module_name.replace("_", ".")
 
+    # Replacements are order-sensitive. First merge leaf "cross_attn" / "self_attn"
+    # (and similar) tokens back, then merge the enclosing compound attribute names
+    # like "adaln_modulation_cross_attn", and finally fall back to the bare
+    # "adaln_modulation" attribute used by FinalLayer / TimestepEmbedding.
     replacements = [
-        # DiT
+        # DiT misc
         ("llm.adapter", "llm_adapter"),
         (".linear.", ".linear_"),
         ("t.embedding.norm", "t_embedding_norm"),
         ("x.embedder", "x_embedder"),
-        ("adaln.modulation.cross_attn", "adaln_modulation_cross_attn"),
-        ("adaln.modulation.mlp", "adaln_modulation_mlp"),
+        # Attention submodule attribute names (must come BEFORE compound adaln rules)
         ("cross.attn", "cross_attn"),
-        ("k.proj", "k_proj"),
-        ("k.norm", "k_norm"),
+        ("self.attn", "self_attn"),
         ("q.proj", "q_proj"),
         ("q.norm", "q_norm"),
+        ("k.proj", "k_proj"),
+        ("k.norm", "k_norm"),
         ("v.proj", "v_proj"),
         ("o.proj", "o_proj"),
         ("output.proj", "output_proj"),
-        ("self.attn", "self_attn"),
-        ("final.layer", "final_layer"),
-        ("adaln.modulation", "adaln_modulation"),
-        ("norm.cross.attn", "norm_cross_attn"),
-        ("norm.mlp", "norm_mlp"),
-        ("norm.self.attn", "norm_self_attn"),
         ("out.proj", "out_proj"),
+        ("final.layer", "final_layer"),
+        # Compound adaln modulation attribute names (single attribute, underscored)
+        ("adaln.modulation.cross_attn", "adaln_modulation_cross_attn"),
+        ("adaln.modulation.self_attn", "adaln_modulation_self_attn"),
+        ("adaln.modulation.mlp", "adaln_modulation_mlp"),
+        # Layer-norm-prefixed attention attributes
+        ("layer.norm.cross_attn", "layer_norm_cross_attn"),
+        ("layer.norm.self_attn", "layer_norm_self_attn"),
+        ("layer.norm.mlp", "layer_norm_mlp"),
+        # norm_* variants
+        ("norm.cross_attn", "norm_cross_attn"),
+        ("norm.self_attn", "norm_self_attn"),
+        ("norm.mlp", "norm_mlp"),
+        # Fallback bare adaln_modulation (FinalLayer / TimestepEmbedding)
+        ("adaln.modulation", "adaln_modulation"),
         # Qwen3
         ("embed.tokens", "embed_tokens"),
         ("input.layernorm", "input_layernorm"),
