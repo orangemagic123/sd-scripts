@@ -786,6 +786,29 @@ class TLoRANetwork(torch.nn.Module):
             metadata["sshs_model_hash"] = model_hash
             metadata["sshs_legacy_hash"] = legacy_hash
             save_file(state_dict, file, metadata)
+
+            # Also emit a ComfyUI-compatible sibling file (<name>_comfy.safetensors)
+            try:
+                from networks.convert_tlora_anima_to_comfy import (
+                    convert_tlora_state_dict_to_comfy,
+                    clean_comfy_metadata,
+                )
+
+                comfy_sd = convert_tlora_state_dict_to_comfy(state_dict, target_dtype=dtype)
+                comfy_metadata = clean_comfy_metadata(metadata)
+                # Recompute hashes for the converted state dict
+                model_hash_c, legacy_hash_c = train_util.precalculate_safetensors_hashes(
+                    comfy_sd, comfy_metadata
+                )
+                comfy_metadata["sshs_model_hash"] = model_hash_c
+                comfy_metadata["sshs_legacy_hash"] = legacy_hash_c
+
+                base, ext = os.path.splitext(file)
+                comfy_file = f"{base}_comfy{ext}"
+                save_file(comfy_sd, comfy_file, metadata=comfy_metadata if comfy_metadata else None)
+                logger.info(f"Saved ComfyUI-compatible LoRA: {comfy_file}")
+            except Exception as e:
+                logger.warning(f"Failed to save ComfyUI-compatible sibling file: {e}")
         else:
             torch.save(state_dict, file)
 
