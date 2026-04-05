@@ -161,7 +161,11 @@ def rename_sd_scripts_key_to_comfy(sd_scripts_key: str) -> str:
         ("llm.adapter", "llm_adapter"),
         (".linear.", ".linear_"),
         ("t.embedding.norm", "t_embedding_norm"),
+        ("t.embedder", "t_embedder"),
         ("x.embedder", "x_embedder"),
+        ("extra.pos.embedder", "extra_pos_embedder"),
+        ("rotary.emb", "rotary_emb"),
+        ("in.proj", "in_proj"),
         # Attention submodule attribute names (must come BEFORE compound adaln rules)
         ("cross.attn", "cross_attn"),
         ("self.attn", "self_attn"),
@@ -170,6 +174,7 @@ def rename_sd_scripts_key_to_comfy(sd_scripts_key: str) -> str:
         ("k.proj", "k_proj"),
         ("k.norm", "k_norm"),
         ("v.proj", "v_proj"),
+        ("v.norm", "v_norm"),
         ("o.proj", "o_proj"),
         ("output.proj", "output_proj"),
         ("out.proj", "out_proj"),
@@ -178,7 +183,7 @@ def rename_sd_scripts_key_to_comfy(sd_scripts_key: str) -> str:
         ("adaln.modulation.cross_attn", "adaln_modulation_cross_attn"),
         ("adaln.modulation.self_attn", "adaln_modulation_self_attn"),
         ("adaln.modulation.mlp", "adaln_modulation_mlp"),
-        # Layer-norm-prefixed attention attributes
+        # Layer-norm-prefixed attention attributes (compound first)
         ("layer.norm.cross_attn", "layer_norm_cross_attn"),
         ("layer.norm.self_attn", "layer_norm_self_attn"),
         ("layer.norm.mlp", "layer_norm_mlp"),
@@ -186,8 +191,9 @@ def rename_sd_scripts_key_to_comfy(sd_scripts_key: str) -> str:
         ("norm.cross_attn", "norm_cross_attn"),
         ("norm.self_attn", "norm_self_attn"),
         ("norm.mlp", "norm_mlp"),
-        # Fallback bare adaln_modulation (FinalLayer / TimestepEmbedding)
+        # Fallback bare attributes
         ("adaln.modulation", "adaln_modulation"),
+        ("layer.norm", "layer_norm"),
         # Qwen3
         ("embed.tokens", "embed_tokens"),
         ("input.layernorm", "input_layernorm"),
