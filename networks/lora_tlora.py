@@ -201,42 +201,39 @@ class OrthogonalTLoRAModule(torch.nn.Module):
         self.p_layer = torch.nn.Linear(lora_dim, out_dim, bias=False)
         self.lambda_layer = torch.nn.Parameter(torch.ones(1, lora_dim))
 
-        # SVD initialization - run on GPU if available for speed
-        svd_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         if use_original_weight:
+            # SVD on original pretrained weight - run on GPU if available for speed
+            svd_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
             if self.is_conv2d:
                 base_m = weight_2d.float().to(svd_device)
             else:
                 base_m = org_module.weight.data.float().to(svd_device)
             u, s, v = torch.linalg.svd(base_m, full_matrices=False)
-            # For weight matrix W = U @ diag(S) @ V, Q=V[:rank], P=U[:,:rank], lambda=S[:rank]
+            u = u.cpu(); s = s.cpu(); v = v.cpu()
+
+            if sig_type == "principal":
+                self.q_layer.weight.data = v[:lora_dim].clone()
+                self.p_layer.weight.data = u[:, :lora_dim].clone()
+                self.lambda_layer.data = s[None, :lora_dim].clone()
+            elif sig_type == "last":
+                self.q_layer.weight.data = v[-lora_dim:].clone()
+                self.p_layer.weight.data = u[:, -lora_dim:].clone()
+                self.lambda_layer.data = s[None, -lora_dim:].clone()
+            elif sig_type == "middle":
+                start_v = math.ceil((v.shape[0] - lora_dim) / 2)
+                start_u = math.ceil((u.shape[1] - lora_dim) / 2)
+                start_s = math.ceil((s.shape[0] - lora_dim) / 2)
+                self.q_layer.weight.data = v[start_v:start_v + lora_dim].clone()
+                self.p_layer.weight.data = u[:, start_u:start_u + lora_dim].clone()
+                self.lambda_layer.data = s[None, start_s:start_s + lora_dim].clone()
+
+            del u, s, v, base_m
+            gc.collect()
         else:
-            base_m = torch.normal(mean=0, std=1.0 / lora_dim, size=(effective_in_dim, out_dim), device=svd_device)
-            u, s, v = torch.linalg.svd(base_m, full_matrices=False)
-
-        # Move SVD results to CPU for storage
-        u = u.cpu()
-        s = s.cpu()
-        v = v.cpu()
-
-        if sig_type == "principal":
-            self.q_layer.weight.data = v[:lora_dim].clone() if not use_original_weight else v[:lora_dim].clone()
-            self.p_layer.weight.data = u[:, :lora_dim].clone()
-            self.lambda_layer.data = s[None, :lora_dim].clone()
-        elif sig_type == "last":
-            self.q_layer.weight.data = v[-lora_dim:].clone()
-            self.p_layer.weight.data = u[:, -lora_dim:].clone()
-            self.lambda_layer.data = s[None, -lora_dim:].clone()
-        elif sig_type == "middle":
-            start_v = math.ceil((v.shape[0] - lora_dim) / 2)
-            start_u = math.ceil((u.shape[1] - lora_dim) / 2)
-            start_s = math.ceil((s.shape[0] - lora_dim) / 2)
-            self.q_layer.weight.data = v[start_v:start_v + lora_dim].clone()
-            self.p_layer.weight.data = u[:, start_u:start_u + lora_dim].clone()
-            self.lambda_layer.data = s[None, start_s:start_s + lora_dim].clone()
-
-        del u, s, v, base_m
-        gc.collect()
+            # Random orthogonal init - skip SVD entirely (orders of magnitude faster)
+            torch.nn.init.orthogonal_(self.q_layer.weight)
+            torch.nn.init.orthogonal_(self.p_layer.weight)
+            self.lambda_layer.data = torch.abs(torch.randn(1, lora_dim)) / math.sqrt(lora_dim)
 
         # Frozen base copies for zero-init residual
         self.base_q = copy.deepcopy(self.q_layer)
