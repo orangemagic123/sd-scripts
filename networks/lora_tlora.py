@@ -46,7 +46,9 @@ class TLoRAModule(torch.nn.Module):
     ):
         super().__init__()
         self.lora_name = lora_name
-        self.network = network
+        # Bypass nn.Module.__setattr__ to prevent auto-registering parent
+        # network as a child submodule (which would create a cycle).
+        object.__setattr__(self, "network", network)
         self.is_unet = is_unet
 
         if org_module.__class__.__name__ == "Conv2d":
@@ -162,7 +164,9 @@ class OrthogonalTLoRAModule(torch.nn.Module):
     ):
         super().__init__()
         self.lora_name = lora_name
-        self.network = network
+        # Bypass nn.Module.__setattr__ to prevent auto-registering parent
+        # network as a child submodule (which would create a cycle).
+        object.__setattr__(self, "network", network)
         self.is_unet = is_unet
 
         if org_module.__class__.__name__ == "Conv2d":
