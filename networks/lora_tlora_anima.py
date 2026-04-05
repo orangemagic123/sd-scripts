@@ -112,18 +112,17 @@ class TLoRAModule(torch.nn.Module):
             lx = torch.nn.functional.dropout(lx, p=self.dropout)
 
         # T-LoRA: apply timestep-dependent sigma mask (only for DiT modules, not text encoder)
-        sigma_mask = None
+        sm = None
         if self.is_unet and self.network is not None:
-            sigma_mask = self.network.current_sigma_mask
+            sm = self.network.current_sigma_mask
 
-        if sigma_mask is not None:
-            sm = sigma_mask
+        if sm is not None:
             if self.lora_dim != sm.shape[-1]:
+                # Dim mismatch (rare): build matching mask using cached r
+                r = self.network.current_sigma_r if self.network.current_sigma_r is not None else self.lora_dim
+                r = min(self.lora_dim, r)
                 sm = torch.ones((1, self.lora_dim), device=lx.device)
-                r = min(self.lora_dim, (sigma_mask > 0).sum().item())
                 sm[:, r:] = 0.0
-            else:
-                sm = sm.to(lx.device)
 
             if isinstance(self.lora_down, torch.nn.Conv2d):
                 sm = sm.unsqueeze(-1).unsqueeze(-1)
@@ -285,42 +284,40 @@ class OrthogonalTLoRAModule(torch.nn.Module):
         orig_dtype = x.dtype
         dtype = self.q_layer.weight.dtype
 
-        sigma_mask = None
-        if self.is_unet and self.network is not None:
-            sigma_mask = self.network.current_sigma_mask
-
-        if sigma_mask is None:
-            mask = torch.ones((1, self.lora_dim), device=x.device)
-        else:
-            mask = sigma_mask.to(x.device)
-            if self.lora_dim != mask.shape[-1]:
-                mask = torch.ones((1, self.lora_dim), device=x.device)
-                r = min(self.lora_dim, (sigma_mask > 0).sum().item())
-                mask[:, r:] = 0.0
+        # Get effective rank from network (set by hook); default to full rank
+        r = self.lora_dim
+        if self.is_unet and self.network is not None and self.network.current_sigma_r is not None:
+            r = min(self.network.current_sigma_r, self.lora_dim)
 
         if self.is_conv2d:
-            q_weight = self.q_layer.weight.data.reshape(
-                self.lora_dim, self.conv_in_channels, *self.conv_kernel_size
-            )
-            base_q_weight = self.base_q.weight.data.reshape(
-                self.lora_dim, self.conv_in_channels, *self.conv_kernel_size
-            )
-            p_weight = self.p_layer.weight.data.reshape(self.p_layer.weight.shape[0], self.lora_dim, 1, 1)
-            base_p_weight = self.base_p.weight.data.reshape(self.base_p.weight.shape[0], self.lora_dim, 1, 1)
+            # Slice to effective rank r - reduces FLOPs and avoids mask multiplication
+            q_weight = self.q_layer.weight[:r].reshape(r, self.conv_in_channels, *self.conv_kernel_size)
+            base_q_weight = self.base_q.weight[:r].reshape(r, self.conv_in_channels, *self.conv_kernel_size)
+            p_weight = self.p_layer.weight[:, :r].reshape(self.p_layer.weight.shape[0], r, 1, 1)
+            base_p_weight = self.base_p.weight[:, :r].reshape(self.base_p.weight.shape[0], r, 1, 1)
 
-            lx = torch.nn.functional.conv2d(x.to(dtype), q_weight, stride=self.conv_stride, padding=self.conv_padding)
-            lx = lx * self.lambda_layer.unsqueeze(-1).unsqueeze(-1) * mask.unsqueeze(-1).unsqueeze(-1)
+            x_dt = x.to(dtype)
+            lx = torch.nn.functional.conv2d(x_dt, q_weight, stride=self.conv_stride, padding=self.conv_padding)
+            lx = lx * self.lambda_layer[:, :r].unsqueeze(-1).unsqueeze(-1)
             lx = torch.nn.functional.conv2d(lx, p_weight)
 
-            base_lx = torch.nn.functional.conv2d(x.to(dtype), base_q_weight, stride=self.conv_stride, padding=self.conv_padding)
-            base_lx = base_lx * self.base_lambda_buf.unsqueeze(-1).unsqueeze(-1) * mask.unsqueeze(-1).unsqueeze(-1)
+            base_lx = torch.nn.functional.conv2d(x_dt, base_q_weight, stride=self.conv_stride, padding=self.conv_padding)
+            base_lx = base_lx * self.base_lambda_buf[:, :r].unsqueeze(-1).unsqueeze(-1)
             base_lx = torch.nn.functional.conv2d(base_lx, base_p_weight)
         else:
-            lx = self.q_layer(x.to(dtype)) * self.lambda_layer * mask
-            lx = self.p_layer(lx)
+            x_dt = x.to(dtype)
+            # Slice weights to effective rank r instead of multiplying by mask
+            q_w = self.q_layer.weight[:r]
+            p_w = self.p_layer.weight[:, :r]
+            lam = self.lambda_layer[:, :r]
+            lx = torch.nn.functional.linear(x_dt, q_w) * lam
+            lx = torch.nn.functional.linear(lx, p_w)
 
-            base_lx = self.base_q(x.to(dtype)) * self.base_lambda_buf * mask
-            base_lx = self.base_p(base_lx)
+            base_q_w = self.base_q.weight[:r]
+            base_p_w = self.base_p.weight[:, :r]
+            base_lam = self.base_lambda_buf[:, :r]
+            base_lx = torch.nn.functional.linear(x_dt, base_q_w) * base_lam
+            base_lx = torch.nn.functional.linear(base_lx, base_p_w)
 
         result = lx - base_lx
         if self.dropout is not None and self.training:
@@ -392,6 +389,7 @@ class TLoRANetwork(torch.nn.Module):
         self.tlora_init = tlora_init
         self.tlora_sig_type = tlora_sig_type
         self.current_sigma_mask = None
+        self.current_sigma_r = None
 
         self.loraplus_lr_ratio = None
         self.loraplus_unet_lr_ratio = None
@@ -548,17 +546,24 @@ class TLoRANetwork(torch.nn.Module):
             timestep = kwargs["timesteps"]
 
         if timestep is not None:
+            # Determine target device from model input to avoid per-module CPU->GPU transfers
+            target_device = None
+            if len(args) >= 1 and isinstance(args[0], torch.Tensor):
+                target_device = args[0].device
+
             if isinstance(timestep, torch.Tensor):
                 t = timestep.flatten()[0] if timestep.dim() > 0 else timestep
+                t = t.item()
             else:
                 t = timestep
-            self.current_sigma_mask = get_timestep_sigma_mask(
-                t,
-                self.tlora_max_timestep,
-                self.lora_dim,
-                self.tlora_min_rank,
-                self.tlora_alpha_rank_scale,
-            )
+            r = int(((self.tlora_max_timestep - t) / self.tlora_max_timestep) ** self.tlora_alpha_rank_scale
+                    * (self.lora_dim - self.tlora_min_rank)) + self.tlora_min_rank
+            r = max(self.tlora_min_rank, min(r, self.lora_dim))
+            # Build mask directly on GPU to avoid per-module .to(device) transfers
+            mask = torch.zeros((1, self.lora_dim), device=target_device)
+            mask[:, :r] = 1.0
+            self.current_sigma_mask = mask
+            self.current_sigma_r = r
 
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
