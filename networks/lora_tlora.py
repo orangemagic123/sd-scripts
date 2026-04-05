@@ -226,9 +226,17 @@ class OrthogonalTLoRAModule(torch.nn.Module):
             del u, s, v, base_m
             gc.collect()
         else:
-            # Random orthogonal init - skip SVD entirely (orders of magnitude faster)
-            torch.nn.init.orthogonal_(self.q_layer.weight)
-            torch.nn.init.orthogonal_(self.p_layer.weight)
+            # Random orthogonal init: do QR on GPU (cuSOLVER) for huge speedup
+            if torch.cuda.is_available():
+                q_w = torch.empty(self.q_layer.weight.shape, device="cuda")
+                p_w = torch.empty(self.p_layer.weight.shape, device="cuda")
+                torch.nn.init.orthogonal_(q_w)
+                torch.nn.init.orthogonal_(p_w)
+                self.q_layer.weight.data = q_w.to("cpu")
+                self.p_layer.weight.data = p_w.to("cpu")
+            else:
+                torch.nn.init.orthogonal_(self.q_layer.weight)
+                torch.nn.init.orthogonal_(self.p_layer.weight)
             self.lambda_layer.data = torch.abs(torch.randn(1, lora_dim)) / math.sqrt(lora_dim)
 
         # Frozen base copies for zero-init residual
@@ -653,14 +661,27 @@ class TLoRANetwork(torch.nn.Module):
         logger.info(f"LoRA+ Text Encoder LR Ratio: {self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}")
 
     def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
-        self.requires_grad_(True)
+        # Enable grads on trainable params only (preserve frozen base_q/base_p)
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if hasattr(lora, "q_layer"):
+                lora.q_layer.weight.requires_grad_(True)
+                lora.p_layer.weight.requires_grad_(True)
+                lora.lambda_layer.requires_grad_(True)
+            else:
+                lora.requires_grad_(True)
         all_params = []
         lr_descriptions = []
+        seen_param_ids = set()
 
         def assemble_params(loras, lr, ratio):
             param_groups = {"lora": {}, "plus": {}}
             for lora in loras:
                 for name, param in lora.named_parameters():
+                    if not param.requires_grad:
+                        continue
+                    if id(param) in seen_param_ids:
+                        continue
+                    seen_param_ids.add(id(param))
                     if ratio is not None and ("lora_up" in name or "p_layer" in name):
                         param_groups["plus"][f"{lora.lora_name}.{name}"] = param
                     else:

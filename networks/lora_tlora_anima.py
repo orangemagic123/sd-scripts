@@ -243,14 +243,20 @@ class OrthogonalTLoRAModule(torch.nn.Module):
                 self.lambda_layer.data = s[None, start_s:start_s + lora_dim].clone()
             del u, s, v, base_m
         else:
-            # Random orthogonal init - no need for SVD on a huge random matrix.
-            # Directly initialize orthonormal Q and P, which is mathematically equivalent
-            # to the SVD of a Gaussian random matrix and is orders of magnitude faster.
-            torch.nn.init.orthogonal_(self.q_layer.weight)
-            torch.nn.init.orthogonal_(self.p_layer.weight)
-            # Initialize lambda with singular-value-like magnitudes from Marchenko-Pastur approx
+            # Random orthogonal init: do QR on GPU (cuSOLVER) for huge speedup
+            # over per-module CPU LAPACK calls.
+            if torch.cuda.is_available():
+                init_device = torch.device("cuda")
+                q_w = torch.empty(self.q_layer.weight.shape, device=init_device)
+                p_w = torch.empty(self.p_layer.weight.shape, device=init_device)
+                torch.nn.init.orthogonal_(q_w)
+                torch.nn.init.orthogonal_(p_w)
+                self.q_layer.weight.data = q_w.to("cpu", non_blocking=False)
+                self.p_layer.weight.data = p_w.to("cpu", non_blocking=False)
+            else:
+                torch.nn.init.orthogonal_(self.q_layer.weight)
+                torch.nn.init.orthogonal_(self.p_layer.weight)
             self.lambda_layer.data = torch.abs(torch.randn(1, lora_dim)) / math.sqrt(lora_dim)
-        gc.collect()
 
         # Frozen base copies
         self.base_q = copy.deepcopy(self.q_layer)
@@ -644,9 +650,15 @@ class TLoRANetwork(torch.nn.Module):
         elif isinstance(text_encoder_lr, float) or isinstance(text_encoder_lr, int):
             text_encoder_lr = [float(text_encoder_lr)]
 
-        self.requires_grad_(True)
+        # Enable grads on trainable params only (preserve frozen base_q/base_p)
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.q_layer.weight.requires_grad_(True)
+            lora.p_layer.weight.requires_grad_(True)
+            lora.lambda_layer.requires_grad_(True)
         all_params = []
         lr_descriptions = []
+        # Track params already added across all groups (defensive de-dup)
+        seen_param_ids = set()
 
         def assemble_params(loras, lr, loraplus_ratio):
             param_groups = {"lora": {}, "plus": {}}
@@ -661,6 +673,11 @@ class TLoRANetwork(torch.nn.Module):
                         break
 
                 for name, param in lora.named_parameters():
+                    if not param.requires_grad:
+                        continue
+                    if id(param) in seen_param_ids:
+                        continue
+                    seen_param_ids.add(id(param))
                     if matched_reg_lr is not None:
                         reg_idx, reg_lr = matched_reg_lr
                         group_key = f"reg_lr_{reg_idx}"
