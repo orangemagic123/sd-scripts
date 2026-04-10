@@ -99,12 +99,10 @@ def main(args):
     bucket_manager = train_util.BucketManager(
         args.bucket_no_upscale, max_reso, args.min_bucket_reso, args.max_bucket_reso, args.bucket_reso_steps
     )
-    if not args.bucket_no_upscale:
-        bucket_manager.make_buckets()
-    else:
-        logger.warning(
-            "min_bucket_reso and max_bucket_reso are ignored if bucket_no_upscale is set, because bucket reso is defined by image size automatically / bucket_no_upscaleが指定された場合は、bucketの解像度は画像サイズから自動計算されるため、min_bucket_resoとmax_bucket_resoは無視されます"
-        )
+    # Predefined buckets are needed even when bucket_no_upscale is set, because images whose
+    # resolution is greater than or equal to the training resolution are still placed into the
+    # predefined buckets.
+    bucket_manager.make_buckets()
 
     # 画像をひとつずつ適切なbucketに割り当てながらlatentを計算する
     img_ar_errors = []
