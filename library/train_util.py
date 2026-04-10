@@ -286,7 +286,15 @@ class BucketManager:
 
     def select_bucket(self, image_width, image_height):
         aspect_ratio = image_width / image_height
-        if not self.no_upscale:
+        # bucket_no_upscale is only applied to images smaller than the training resolution.
+        # Images with area >= max_area are bucketed as if no_upscale were False (they are
+        # downscaled to a predefined bucket instead of getting their own arbitrary bucket).
+        use_no_upscale = (
+            self.no_upscale
+            and self.max_area is not None
+            and image_width * image_height < self.max_area
+        )
+        if not use_no_upscale:
             # 拡大および縮小を行う
             # 同じaspect ratioがあるかもしれないので（fine tuningで、no_upscale=Trueで前処理した場合）、解像度が同じものを優先する
             reso = (image_width, image_height)
@@ -1129,12 +1137,10 @@ class BaseDataset(torch.utils.data.Dataset):
                     self.max_bucket_reso,
                     self.bucket_reso_steps,
                 )
-                if not self.bucket_no_upscale:
-                    self.bucket_manager.make_buckets()
-                else:
-                    logger.warning(
-                        "min_bucket_reso and max_bucket_reso are ignored if bucket_no_upscale is set, because bucket reso is defined by image size automatically / bucket_no_upscaleが指定された場合は、bucketの解像度は画像サイズから自動計算されるため、min_bucket_resoとmax_bucket_resoは無視されます"
-                    )
+                # Predefined buckets are needed for both cases now: when bucket_no_upscale is
+                # set we still fall back to predefined buckets for images whose resolution is
+                # greater than or equal to the training resolution.
+                self.bucket_manager.make_buckets()
 
             img_ar_errors = []
             for image_info in self.image_data.values():
@@ -4843,7 +4849,9 @@ def add_dataset_arguments(
     parser.add_argument(
         "--bucket_no_upscale",
         action="store_true",
-        help="make bucket for each image without upscaling / 画像を拡大せずbucketを作成します",
+        help="make bucket for each image without upscaling; only applied to images smaller"
+        " than the training resolution, larger images use predefined buckets as usual"
+        " / 画像を拡大せずにbucketを作成します。学習解像度より小さい画像にのみ適用され、大きい画像は通常どおり定義済みbucketが使用されます",
     )
     parser.add_argument(
         "--resize_interpolation",
