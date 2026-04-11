@@ -68,10 +68,21 @@ def _str_to_dtype(p):
 
 
 def _natural_sort_key(path: str):
-    """Sort file paths so that epoch2 < epoch10 (natural numeric ordering)."""
-    name = os.path.basename(path)
-    parts = re.split(r"(\d+)", name)
-    return [int(p) if p.isdigit() else p.lower() for p in parts]
+    """Sort file paths naturally (epoch2 < epoch10).
+
+    Files whose stem contains no digit group are pushed to the end, so that a
+    final checkpoint like ``A.safetensors`` sorts after all per-epoch files like
+    ``A-000002.safetensors`` or ``A_000002.safetensors`` regardless of the
+    separator used. sd-scripts writes the final LoRA without an epoch suffix,
+    and this matches that convention.
+    """
+    name = os.path.basename(path).lower()
+    stem, ext = os.path.splitext(name)
+    parts = re.split(r"(\d+)", stem)
+    has_number = any(p.isdigit() for p in parts)
+    tokens = [int(p) if p.isdigit() else p for p in parts]
+    # primary key: 0 for numbered files, 1 for unnumbered (unnumbered last)
+    return (0 if has_number else 1, tokens, ext)
 
 
 def _is_non_ema_key(key: str) -> bool:
