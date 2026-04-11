@@ -32,6 +32,14 @@ Usage examples:
         --ema_decay 0.9 \
         --save_to /path/to/A_lora_ema.safetensors \
         --save_every_step
+
+    # Only apply EMA from epoch 50 onward (earlier epochs are skipped;
+    # the final 'A.safetensors' is always kept)
+    python networks/ema_lora.py \
+        --model_dir /path/to/A_lora_epochs \
+        --start_epoch 50 \
+        --ema_decay 0.9 \
+        --save_to /path/to/A_lora_ema.safetensors
 """
 
 import argparse
@@ -89,23 +97,25 @@ def _is_non_ema_key(key: str) -> bool:
     return any(s in key for s in NON_EMA_KEY_SUBSTRINGS)
 
 
-def _detect_source_dtype(sd: dict):
-    """Return the dtype of a representative weight tensor in the state dict.
+def _extract_epoch(path: str):
+    """Return the trailing epoch number in a checkpoint filename, or None.
 
-    Prefers a non-scalar tensor (so we don't pick the `.alpha` scalars which
-    may be stored as float32 even when the main weights are fp16/bf16).
+    sd-scripts saves intermediate LoRA checkpoints with the pattern
+    ``{output_name}-{epoch:06d}.safetensors`` (and sometimes step-based
+    ``-step{n}``). We use the last digit group in the stem as the epoch
+    number. Files whose stem contains no digits — for example the final
+    ``A.safetensors`` — return ``None`` and are treated as "after all
+    numbered epochs" by callers.
     """
-    fallback = None
-    for v in sd.values():
-        if isinstance(v, torch.Tensor):
-            if v.numel() > 1:
-                return v.dtype
-            if fallback is None:
-                fallback = v.dtype
-    return fallback
+    name = os.path.basename(path)
+    stem = os.path.splitext(name)[0]
+    matches = re.findall(r"\d+", stem)
+    if not matches:
+        return None
+    return int(matches[-1])
 
 
-def _load_state_dict(file_name: str, dtype) -> Tuple[dict, dict, "torch.dtype"]:
+def _load_state_dict(file_name: str, dtype) -> Tuple[dict, dict]:
     if os.path.splitext(file_name)[1] == ".safetensors":
         sd = load_file(file_name)
         metadata = train_util.load_metadata_from_safetensors(file_name)
@@ -156,6 +166,25 @@ def _collect_models(args) -> List[str]:
                 continue
             entries.append(full)
         models = sorted(entries, key=_natural_sort_key)
+
+    if args.start_epoch is not None:
+        filtered = []
+        skipped = []
+        for path in models:
+            epoch = _extract_epoch(path)
+            # keep unnumbered files (e.g. the final "A.safetensors") and any
+            # file whose trailing epoch number is >= start_epoch
+            if epoch is None or epoch >= args.start_epoch:
+                filtered.append(path)
+            else:
+                skipped.append(path)
+        if skipped:
+            logger.info(
+                f"--start_epoch={args.start_epoch}: skipping {len(skipped)} checkpoint(s) below threshold"
+            )
+            for p in skipped:
+                logger.info(f"  skip: {os.path.basename(p)} (epoch={_extract_epoch(p)})")
+        models = filtered
 
     if len(models) == 0:
         raise ValueError("No checkpoints found to apply EMA on")
@@ -317,6 +346,18 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional regex to filter filenames when using --model_dir / "
         "--model_dir 사용 시 파일명 필터로 적용할 정규식 (선택)",
+    )
+    parser.add_argument(
+        "--start_epoch",
+        type=int,
+        default=None,
+        help="only apply EMA from this epoch onward (inclusive). A checkpoint's "
+        "epoch is read from the last digit group in its filename stem (e.g. "
+        "'A-000050.safetensors' -> 50). Files with no digits in the stem, such "
+        "as the final 'A.safetensors', are always kept. / "
+        "지정한 에폭 이상부터 EMA를 적용합니다 (경계값 포함). 파일명 stem의 마지막 "
+        "숫자 그룹을 에폭으로 해석합니다 (예: 'A-000050.safetensors' -> 50). 숫자가 "
+        "없는 파일(예: 최종 'A.safetensors')은 항상 포함됩니다.",
     )
     parser.add_argument(
         "--ema_decay",
