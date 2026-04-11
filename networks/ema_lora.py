@@ -89,7 +89,23 @@ def _is_non_ema_key(key: str) -> bool:
     return any(s in key for s in NON_EMA_KEY_SUBSTRINGS)
 
 
-def _load_state_dict(file_name: str, dtype) -> Tuple[dict, dict]:
+def _detect_source_dtype(sd: dict):
+    """Return the dtype of a representative weight tensor in the state dict.
+
+    Prefers a non-scalar tensor (so we don't pick the `.alpha` scalars which
+    may be stored as float32 even when the main weights are fp16/bf16).
+    """
+    fallback = None
+    for v in sd.values():
+        if isinstance(v, torch.Tensor):
+            if v.numel() > 1:
+                return v.dtype
+            if fallback is None:
+                fallback = v.dtype
+    return fallback
+
+
+def _load_state_dict(file_name: str, dtype) -> Tuple[dict, dict, "torch.dtype"]:
     if os.path.splitext(file_name)[1] == ".safetensors":
         sd = load_file(file_name)
         metadata = train_util.load_metadata_from_safetensors(file_name)
@@ -97,12 +113,14 @@ def _load_state_dict(file_name: str, dtype) -> Tuple[dict, dict]:
         sd = torch.load(file_name, map_location="cpu")
         metadata = {}
 
+    source_dtype = _detect_source_dtype(sd)
+
     if dtype is not None:
         for key in list(sd.keys()):
             if isinstance(sd[key], torch.Tensor):
                 sd[key] = sd[key].to(dtype)
 
-    return sd, metadata
+    return sd, metadata, source_dtype
 
 
 def _save_state_dict(file_name: str, state_dict: dict, dtype, metadata: dict):
@@ -162,8 +180,14 @@ def apply_ema(
 
     # initialize EMA from the first checkpoint
     logger.info(f"loading initial checkpoint: {models[0]}")
-    ema_sd, first_metadata = _load_state_dict(models[0], compute_dtype)
+    ema_sd, first_metadata, source_dtype = _load_state_dict(models[0], compute_dtype)
     last_metadata = first_metadata
+
+    # if the caller did not request a specific save dtype, preserve the source
+    # dtype so the output file size matches the input files (e.g. fp16 in -> fp16 out)
+    if save_dtype is None:
+        save_dtype = source_dtype
+        logger.info(f"save_dtype not specified; using source dtype: {save_dtype}")
 
     if save_every_step:
         step_path = _build_step_path(save_to, 0, models[0])
@@ -173,7 +197,7 @@ def apply_ema(
 
     for step, model_path in enumerate(models[1:], start=1):
         logger.info(f"loading checkpoint [{step}]: {model_path}")
-        cur_sd, cur_metadata = _load_state_dict(model_path, compute_dtype)
+        cur_sd, cur_metadata, _ = _load_state_dict(model_path, compute_dtype)
         last_metadata = cur_metadata if keep_last_metadata else last_metadata
 
         ema_keys = set(ema_sd.keys())
@@ -242,9 +266,10 @@ def _build_step_path(save_to: str, step: int, source_model: str) -> str:
 
 def run(args):
     compute_dtype = _str_to_dtype(args.precision)
+    # NOTE: intentionally do NOT fall back to compute_dtype here. A None
+    # save_dtype is interpreted by apply_ema() as "preserve the source
+    # checkpoint's dtype" so the output file size matches the input.
     save_dtype = _str_to_dtype(args.save_precision)
-    if save_dtype is None:
-        save_dtype = compute_dtype
 
     if args.save_to is None:
         raise ValueError("--save_to must be specified")
@@ -326,8 +351,10 @@ def setup_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=[None, "float", "fp16", "bf16"],
-        help="precision when saving (defaults to --precision) / "
-        "저장 시 정밀도 (미지정 시 --precision과 동일)",
+        help="precision when saving; if omitted, the dtype of the source "
+        "checkpoints is preserved so the output file size matches the input / "
+        "저장 시 정밀도. 생략 시 원본 체크포인트의 dtype을 그대로 사용하여 "
+        "출력 파일 크기가 원본과 동일하게 유지됩니다",
     )
     return parser
 
