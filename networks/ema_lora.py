@@ -115,7 +115,23 @@ def _extract_epoch(path: str):
     return int(matches[-1])
 
 
-def _load_state_dict(file_name: str, dtype) -> Tuple[dict, dict]:
+def _detect_source_dtype(sd: dict):
+    """Return the dtype of a representative weight tensor in the state dict.
+
+    Prefers a non-scalar tensor (so we don't pick the `.alpha` scalars which
+    may be stored as float32 even when the main weights are fp16/bf16).
+    """
+    fallback = None
+    for v in sd.values():
+        if isinstance(v, torch.Tensor):
+            if v.numel() > 1:
+                return v.dtype
+            if fallback is None:
+                fallback = v.dtype
+    return fallback
+
+
+def _load_state_dict(file_name: str, dtype) -> Tuple[dict, dict, "torch.dtype"]:
     if os.path.splitext(file_name)[1] == ".safetensors":
         sd = load_file(file_name)
         metadata = train_util.load_metadata_from_safetensors(file_name)
