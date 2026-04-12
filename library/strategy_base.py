@@ -329,12 +329,14 @@ class TextEncoderOutputsCachingStrategy:
         skip_disk_cache_validity_check: bool,
         is_partial: bool = False,
         is_weighted: bool = False,
+        num_variants: int = 0,
     ) -> None:
         self._cache_to_disk = cache_to_disk
         self._batch_size = batch_size
         self.skip_disk_cache_validity_check = skip_disk_cache_validity_check
         self._is_partial = is_partial
         self._is_weighted = is_weighted
+        self._num_variants = num_variants
 
     @classmethod
     def set_strategy(cls, strategy):
@@ -362,6 +364,10 @@ class TextEncoderOutputsCachingStrategy:
     def is_weighted(self):
         return self._is_weighted
 
+    @property
+    def num_variants(self):
+        return self._num_variants
+
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         raise NotImplementedError
 
@@ -372,8 +378,17 @@ class TextEncoderOutputsCachingStrategy:
         raise NotImplementedError
 
     def cache_batch_outputs(
-        self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, batch: List
+        self,
+        tokenize_strategy: TokenizeStrategy,
+        models: List[Any],
+        text_encoding_strategy: TextEncodingStrategy,
+        batch: List,
+        captions: Optional[List[str]] = None,
+        variant_idx: Optional[int] = None,
     ):
+        raise NotImplementedError
+
+    def get_variant_outputs_npz_path(self, image_abs_path: str, variant_idx: int) -> str:
         raise NotImplementedError
 
 

@@ -52,9 +52,29 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             args.cache_text_encoder_outputs = True
 
         if args.cache_text_encoder_outputs:
-            assert train_dataset_group.is_text_encoder_output_cacheable(
-                cache_supports_dropout=True
-            ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
+            num_variants = getattr(args, "cache_text_encoder_outputs_num_variants", 0) or 0
+            if num_variants > 0:
+                # Variant caching allows shuffle_caption and caption_tag_dropout_rate,
+                # but token_warmup_step and caption_mode="mixed" are still incompatible
+                for dataset in train_dataset_group.datasets:
+                    for subset in dataset.subsets:
+                        assert subset.token_warmup_step <= 0, (
+                            "token_warmup_step cannot be used with cache_text_encoder_outputs_num_variants"
+                            " (token_warmup_step is step-based, not epoch-based)"
+                        )
+                        assert getattr(subset, "caption_mode", "tags") != "mixed", (
+                            "caption_mode='mixed' cannot be used with cache_text_encoder_outputs_num_variants"
+                        )
+                if not args.cache_text_encoder_outputs_to_disk:
+                    logger.warning(
+                        "cache_text_encoder_outputs_num_variants requires disk caching,"
+                        " enabling cache_text_encoder_outputs_to_disk"
+                    )
+                    args.cache_text_encoder_outputs_to_disk = True
+            else:
+                assert train_dataset_group.is_text_encoder_output_cacheable(
+                    cache_supports_dropout=True
+                ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
 
         assert (
             args.network_train_unet_only or not args.cache_text_encoder_outputs
@@ -162,8 +182,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
+            num_variants = getattr(args, "cache_text_encoder_outputs_num_variants", 0) or 0
             return strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False
+                args.cache_text_encoder_outputs_to_disk,
+                args.text_encoder_batch_size,
+                args.skip_cache_check,
+                False,
+                num_variants=num_variants,
             )
         return None
 
@@ -171,6 +196,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
     ):
         if args.cache_text_encoder_outputs:
+            num_variants = getattr(args, "cache_text_encoder_outputs_num_variants", 0) or 0
+
             if not args.lowram:
                 # We cannot move DiT to CPU because of block swap, so only move VAE
                 logger.info("move vae to cpu to save memory")
@@ -182,7 +209,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             text_encoders[0].to(accelerator.device)
 
             with accelerator.autocast():
-                dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
+                if num_variants > 0:
+                    dataset.new_cache_text_encoder_outputs_variants(num_variants, text_encoders, accelerator)
+                else:
+                    dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
 
             # cache sample prompts
             if args.sample_prompts is not None:
