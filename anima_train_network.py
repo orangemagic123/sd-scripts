@@ -54,16 +54,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if args.cache_text_encoder_outputs:
             num_variants = getattr(args, "cache_text_encoder_outputs_num_variants", 0) or 0
             if num_variants > 0:
-                # Variant caching allows shuffle_caption and caption_tag_dropout_rate,
-                # but token_warmup_step and caption_mode="mixed" are still incompatible
+                # Variant caching allows shuffle_caption, caption_tag_dropout_rate, and caption_mode="mixed",
+                # but token_warmup_step is still incompatible (step-based, not epoch-based)
                 for dataset in train_dataset_group.datasets:
                     for subset in dataset.subsets:
                         assert subset.token_warmup_step <= 0, (
                             "token_warmup_step cannot be used with cache_text_encoder_outputs_num_variants"
                             " (token_warmup_step is step-based, not epoch-based)"
-                        )
-                        assert getattr(subset, "caption_mode", "tags") != "mixed", (
-                            "caption_mode='mixed' cannot be used with cache_text_encoder_outputs_num_variants"
                         )
                 if not args.cache_text_encoder_outputs_to_disk:
                     logger.warning(
