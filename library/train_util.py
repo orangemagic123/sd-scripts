@@ -1888,6 +1888,7 @@ class BaseDataset(torch.utils.data.Dataset):
             )
             text_encoder_outputs = None
             input_ids = None
+            caption_debug = None
 
             if image_info.text_encoder_outputs is not None:
                 # cached
@@ -1938,10 +1939,13 @@ class BaseDataset(torch.utils.data.Dataset):
                 #         else:
                 #             token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
                 #         input_ids2_list.append(token_caption2)
+            elif self.log_captions_every_n_steps > 0:
+                # process caption for debug logging even when tokenization is not required (e.g. cached text encoder outputs)
+                caption, caption_debug = self.process_caption(subset, image_info.caption, image_info.caption_nl)
 
             input_ids_list.append(input_ids)
             captions.append(caption)
-            if self.log_captions_every_n_steps > 0 and tokenization_required:
+            if self.log_captions_every_n_steps > 0 and (tokenization_required or caption_debug is not None):
                 tokens = [t.strip() for t in caption.split(subset.caption_separator) if t.strip()]
                 caption_preview = ", ".join(tokens[: self.log_captions_max_length])
                 if len(tokens) > self.log_captions_max_length:
