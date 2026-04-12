@@ -947,7 +947,9 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return caption, dropped_tags
 
-    def process_caption(self, subset: BaseSubset, caption: str, caption_nl: Optional[str] = None):
+    def process_caption(
+        self, subset: BaseSubset, caption: str, caption_nl: Optional[str] = None, skip_caption_dropout: bool = False
+    ):
         debug_info = {"caption_mode": "tags", "dropped_tags": []}
         # caption に prefix/suffix を付ける
         if subset.caption_prefix:
@@ -956,12 +958,16 @@ class BaseDataset(torch.utils.data.Dataset):
             caption = caption + " " + subset.caption_suffix
 
         # dropoutの決定：tag dropがこのメソッド内にあるのでここで行うのが良い
-        is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
-        is_drop_out = (
-            is_drop_out
-            or (subset.caption_dropout_every_n_epochs > 0
-                and self.current_epoch % subset.caption_dropout_every_n_epochs == 0)
-        )
+        # skip_caption_dropout=True の場合、caption_dropout はスキップ（variant cache 用：学習時に別途適用）
+        if skip_caption_dropout:
+            is_drop_out = False
+        else:
+            is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
+            is_drop_out = (
+                is_drop_out
+                or (subset.caption_dropout_every_n_epochs > 0
+                    and self.current_epoch % subset.caption_dropout_every_n_epochs == 0)
+            )
 
         if is_drop_out:
             caption = ""
@@ -1461,6 +1467,75 @@ class BaseDataset(torch.utils.data.Dataset):
             # cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
             caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
 
+    def new_cache_text_encoder_outputs_variants(self, num_variants: int, models: List[Any], accelerator):
+        r"""
+        Cache multiple variants of text encoder outputs with different shuffle/tag_dropout applied.
+        Each variant gets a different random shuffle and tag dropout, enabling caption diversity with caching.
+        During training, variant (epoch % num_variants) is loaded for each epoch.
+        """
+        tokenize_strategy = TokenizeStrategy.get_strategy()
+        text_encoding_strategy = TextEncodingStrategy.get_strategy()
+        caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
+        batch_size = caching_strategy.batch_size or self.batch_size
+
+        logger.info(f"caching Text Encoder outputs with {num_variants} caption variants per image.")
+        image_infos = list(self.image_data.values())
+
+        # support multiple-gpus
+        num_processes = accelerator.num_processes
+        process_index = accelerator.process_index
+
+        # Set npz path on all image_infos so __getitem__ knows caching is active
+        if caching_strategy.cache_to_disk:
+            for info in image_infos:
+                te_out_npz = caching_strategy.get_outputs_npz_path(info.absolute_path)
+                info.text_encoder_outputs_npz = te_out_npz
+
+        for variant_idx in range(num_variants):
+            logger.info(f"caching variant {variant_idx + 1}/{num_variants}...")
+
+            batches = []
+            batch = []
+            batch_captions = []
+
+            for i, info in enumerate(image_infos):
+                # skip if not this process's responsibility
+                if i % num_processes != process_index:
+                    continue
+
+                # check if this variant's cache already exists on disk
+                if caching_strategy.cache_to_disk:
+                    variant_npz_path = caching_strategy.get_variant_outputs_npz_path(info.absolute_path, variant_idx)
+                    if caching_strategy.is_disk_cached_outputs_expected(variant_npz_path):
+                        continue  # already cached
+
+                # Process caption with shuffle/tag_dropout, but skip caption_dropout
+                # (caption_dropout is handled at training time via cached caption_dropout_rate)
+                subset = self.image_to_subset[info.image_key]
+                caption, _ = self.process_caption(subset, info.caption, info.caption_nl, skip_caption_dropout=True)
+
+                batch.append(info)
+                batch_captions.append(caption)
+
+                if len(batch) >= batch_size:
+                    batches.append((batch, batch_captions))
+                    batch = []
+                    batch_captions = []
+
+            if len(batch) > 0:
+                batches.append((batch, batch_captions))
+
+            if len(batches) == 0:
+                logger.info(f"  no Text Encoder outputs to cache for variant {variant_idx}")
+                continue
+
+            logger.info(f"  caching {sum(len(b[0]) for b in batches)} images for variant {variant_idx}...")
+            for batch_infos, captions in tqdm(batches, smoothing=1, total=len(batches)):
+                caching_strategy.cache_batch_outputs(
+                    tokenize_strategy, models, text_encoding_strategy, batch_infos,
+                    captions=captions, variant_idx=variant_idx,
+                )
+
     # if weight_dtype is specified, Text Encoder itself and output will be converted to the dtype
     # this method is only for SDXL, but it should be implemented here because it needs to be a method of dataset
     # to support SD1/2, it needs a flag for v2, but it is postponed
@@ -1818,10 +1893,19 @@ class BaseDataset(torch.utils.data.Dataset):
                 # cached
                 text_encoder_outputs = image_info.text_encoder_outputs
             elif image_info.text_encoder_outputs_npz is not None:
-                # on disk
-                text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
-                    image_info.text_encoder_outputs_npz
-                )
+                # on disk: check for variant cache
+                if (
+                    self.text_encoder_output_caching_strategy is not None
+                    and self.text_encoder_output_caching_strategy.num_variants > 0
+                    and hasattr(self.text_encoder_output_caching_strategy, "get_variant_outputs_npz_path")
+                ):
+                    variant_idx = self.current_epoch % self.text_encoder_output_caching_strategy.num_variants
+                    npz_path = self.text_encoder_output_caching_strategy.get_variant_outputs_npz_path(
+                        image_info.absolute_path, variant_idx
+                    )
+                else:
+                    npz_path = image_info.text_encoder_outputs_npz
+                text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(npz_path)
             else:
                 tokenization_required = True
             text_encoder_outputs_list.append(text_encoder_outputs)
@@ -2851,6 +2935,12 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
         for i, dataset in enumerate(self.datasets):
             logger.info(f"[Dataset {i}]")
             dataset.new_cache_text_encoder_outputs(models, accelerator)
+        accelerator.wait_for_everyone()
+
+    def new_cache_text_encoder_outputs_variants(self, num_variants: int, models: List[Any], accelerator: Accelerator):
+        for i, dataset in enumerate(self.datasets):
+            logger.info(f"[Dataset {i}]")
+            dataset.new_cache_text_encoder_outputs_variants(num_variants, models, accelerator)
         accelerator.wait_for_everyone()
 
     def set_caching_mode(self, caching_mode):
@@ -4471,6 +4561,17 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
         default=None,
         help="text encoder batch size (default: None, use dataset's batch size)"
         + " / text encoderのバッチサイズ（デフォルト: None, データセットのバッチサイズを使用）",
+    )
+    parser.add_argument(
+        "--cache_text_encoder_outputs_num_variants",
+        type=int,
+        default=0,
+        help="number of caption variants to cache per image for text encoder outputs."
+        " When > 0, enables shuffle_caption and caption_tag_dropout_rate with caching"
+        " by pre-generating multiple cached variants. Each epoch uses variant (epoch %% num_variants)."
+        " Requires cache_text_encoder_outputs_to_disk."
+        " / テキストエンコーダ出力のキャプションバリエーション数。0より大きい場合、"
+        "キャッシュ使用時でもshuffle_captionやcaption_tag_dropout_rateが使用可能になります。",
     )
 
     # Model loading optimization

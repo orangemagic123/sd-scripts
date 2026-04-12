@@ -162,11 +162,15 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         batch_size: int,
         skip_disk_cache_validity_check: bool,
         is_partial: bool = False,
+        num_variants: int = 0,
     ) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial)
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, num_variants=num_variants)
 
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         return os.path.splitext(image_abs_path)[0] + self.ANIMA_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
+
+    def get_variant_outputs_npz_path(self, image_abs_path: str, variant_idx: int) -> str:
+        return os.path.splitext(image_abs_path)[0] + f"_anima_te_v{variant_idx}.npz"
 
     def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
         if not self.cache_to_disk:
@@ -209,9 +213,12 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         models: List[Any],
         text_encoding_strategy: TextEncodingStrategy,
         infos: List,
+        captions: Optional[List[str]] = None,
+        variant_idx: Optional[int] = None,
     ):
         anima_text_encoding_strategy: AnimaTextEncodingStrategy = text_encoding_strategy
-        captions = [info.caption for info in infos]
+        if captions is None:
+            captions = [info.caption for info in infos]
 
         tokens_and_masks = tokenize_strategy.tokenize(captions)
         with torch.no_grad():
@@ -235,8 +242,12 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             caption_dropout_rate = torch.tensor(info.caption_dropout_rate, dtype=torch.float32)
 
             if self.cache_to_disk:
+                if variant_idx is not None:
+                    npz_path = self.get_variant_outputs_npz_path(info.absolute_path, variant_idx)
+                else:
+                    npz_path = info.text_encoder_outputs_npz
                 np.savez(
-                    info.text_encoder_outputs_npz,
+                    npz_path,
                     prompt_embeds=prompt_embeds_i,
                     attn_mask=attn_mask_i,
                     t5_input_ids=t5_input_ids_i,
