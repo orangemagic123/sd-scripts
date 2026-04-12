@@ -944,6 +944,17 @@ class BaseDataset(torch.utils.data.Dataset):
                 flex_tokens = kept
 
             caption = subset.caption_separator.join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+        elif (
+            hasattr(subset, "keep_tokens_separator")
+            and subset.keep_tokens_separator
+            and subset.keep_tokens_separator in caption
+        ):
+            # Strip keep_tokens_separator even when shuffle/warmup/dropout are not active
+            parts = caption.split(subset.keep_tokens_separator)
+            all_tokens = []
+            for part in parts:
+                all_tokens.extend([t.strip() for t in part.split(subset.caption_separator) if t.strip()])
+            caption = subset.caption_separator.join(all_tokens)
 
         return caption, dropped_tags
 
@@ -1465,7 +1476,29 @@ class BaseDataset(torch.utils.data.Dataset):
         logger.info("caching Text Encoder outputs...")
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
             # cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
+
+            # Strip keep_tokens_separator from captions before caching to text encoder
+            original_captions = {}
+            for info in batch:
+                subset = self.image_to_subset[info.image_key]
+                if (
+                    hasattr(subset, "keep_tokens_separator")
+                    and subset.keep_tokens_separator
+                    and subset.keep_tokens_separator in info.caption
+                ):
+                    original_captions[info.image_key] = info.caption
+                    parts = info.caption.split(subset.keep_tokens_separator)
+                    all_tokens = []
+                    for part in parts:
+                        all_tokens.extend([t.strip() for t in part.split(subset.caption_separator) if t.strip()])
+                    info.caption = subset.caption_separator.join(all_tokens)
+
             caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
+
+            # Restore original captions so keep_tokens_separator is preserved for training-time processing
+            for info in batch:
+                if info.image_key in original_captions:
+                    info.caption = original_captions[info.image_key]
 
     def new_cache_text_encoder_outputs_variants(self, num_variants: int, models: List[Any], accelerator):
         r"""
