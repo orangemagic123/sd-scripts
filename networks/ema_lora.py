@@ -65,6 +65,34 @@ logger = logging.getLogger(__name__)
 NON_EMA_KEY_SUBSTRINGS = (".alpha",)
 
 
+# sd-scripts writes intermediate checkpoints using these patterns (see
+# library/train_util.py):
+#   EPOCH_FILE_NAME: "{output_name}-{epoch:06d}"      -> '...-000042'
+#   STEP_FILE_NAME:  "{output_name}-step{step:08d}"   -> '...-step00001000'
+# We only treat a trailing group that matches these exact shapes as the epoch
+# suffix. Requiring the zero-padded digit counts (6 for epochs, 8 for steps)
+# makes this robust against an output_name that itself ends in '-<digits>'
+# (for example 'v1-2.safetensors') and, importantly, against output_names
+# that merely contain digits somewhere in the middle (for example
+# 'hazano163A.safetensors', where an earlier implementation would otherwise
+# have read '163' as an epoch number).
+_EPOCH_SUFFIX_RE = re.compile(r"-(?:step(\d{8,})|(\d{6,}))$")
+
+
+def _split_epoch_suffix(stem: str):
+    """Return (base_name, epoch_or_None) for a checkpoint filename stem.
+
+    ``None`` is returned for stems that do not end with an sd-scripts style
+    epoch/step marker, which is how we recognise the final ``{output_name}``
+    checkpoint that is written without any numeric suffix.
+    """
+    m = _EPOCH_SUFFIX_RE.search(stem)
+    if not m:
+        return stem, None
+    epoch = int(m.group(1) if m.group(1) is not None else m.group(2))
+    return stem[: m.start()], epoch
+
+
 def _str_to_dtype(p):
     if p == "float":
         return torch.float
@@ -78,19 +106,25 @@ def _str_to_dtype(p):
 def _natural_sort_key(path: str):
     """Sort file paths naturally (epoch2 < epoch10).
 
-    Files whose stem contains no digit group are pushed to the end, so that a
-    final checkpoint like ``A.safetensors`` sorts after all per-epoch files like
-    ``A-000002.safetensors`` or ``A_000002.safetensors`` regardless of the
-    separator used. sd-scripts writes the final LoRA without an epoch suffix,
-    and this matches that convention.
+    Only the trailing ``-<epoch>`` / ``-step<step>`` suffix produced by
+    sd-scripts is treated as the numeric "epoch key"; digits elsewhere in the
+    base name are sorted as part of the base name itself. Files without such a
+    trailing suffix (typically the final ``{output_name}.safetensors`` that
+    sd-scripts writes at the end of training) are pushed to the end of their
+    natural group so that the EMA runs from oldest to newest and the final
+    checkpoint dominates the average.
     """
     name = os.path.basename(path).lower()
     stem, ext = os.path.splitext(name)
-    parts = re.split(r"(\d+)", stem)
-    has_number = any(p.isdigit() for p in parts)
-    tokens = [int(p) if p.isdigit() else p for p in parts]
-    # primary key: 0 for numbered files, 1 for unnumbered (unnumbered last)
-    return (0 if has_number else 1, tokens, ext)
+    base, epoch = _split_epoch_suffix(stem)
+    # Natural-sort the base name so e.g. 'runA' < 'runB' and 'v2' < 'v10'
+    # within the base (independent of epoch suffix handling).
+    base_parts = re.split(r"(\d+)", base)
+    base_tokens = tuple(int(p) if p.isdigit() else p for p in base_parts)
+    has_epoch = epoch is not None
+    # Secondary key: 0 for numbered epoch files, 1 for unnumbered files,
+    # so the final unnumbered checkpoint sorts AFTER its numbered siblings.
+    return (base_tokens, 0 if has_epoch else 1, epoch if has_epoch else 0, ext)
 
 
 def _is_non_ema_key(key: str) -> bool:
@@ -102,17 +136,17 @@ def _extract_epoch(path: str):
 
     sd-scripts saves intermediate LoRA checkpoints with the pattern
     ``{output_name}-{epoch:06d}.safetensors`` (and sometimes step-based
-    ``-step{n}``). We use the last digit group in the stem as the epoch
-    number. Files whose stem contains no digits — for example the final
-    ``A.safetensors`` — return ``None`` and are treated as "after all
-    numbered epochs" by callers.
+    ``-step{n}``). Only a suffix that matches one of those exact shapes is
+    recognised, so digits embedded in ``output_name`` itself (e.g.
+    ``hazano163A.safetensors``) are not mistaken for an epoch number.
+    Files whose stem has no such trailing suffix — typically the final
+    ``{output_name}.safetensors`` — return ``None`` and are treated as
+    "after all numbered epochs" by callers.
     """
     name = os.path.basename(path)
     stem = os.path.splitext(name)[0]
-    matches = re.findall(r"\d+", stem)
-    if not matches:
-        return None
-    return int(matches[-1])
+    _, epoch = _split_epoch_suffix(stem)
+    return epoch
 
 
 def _detect_source_dtype(sd: dict):
