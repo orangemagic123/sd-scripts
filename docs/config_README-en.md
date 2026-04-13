@@ -235,6 +235,15 @@ Options related to the setting of subsets that caption dropout can be used for.
 | `caption_dropout_every_n_epochs` | o | o | o |
 | `caption_dropout_rate` | o | o | o |
 | `caption_tag_dropout_rate` | o | o | o |
+| `caption_mode` | o | o | o |
+| `mixed_weights` | o | o | o |
+| `protected_tags_file` | o | o | o |
+
+* `caption_mode`: One of `"tags"` (default) or `"mixed"`. In `mixed` mode each image must have a second caption file with the suffix `_nl` before its extension (e.g. `image.caption` and `image_nl.caption`); the dataloader randomly samples one of `tags`, `nl`, `tags_nl`, `nl_tags` per step.
+* `mixed_weights`: Optional sampling weights for the four `mixed` modes, e.g. `mixed_weights = { tags = 1, nl = 1, tags_nl = 1, nl_tags = 1 }`. Only used when `caption_mode = "mixed"`.
+* `protected_tags_file`: Path to a plain-text file containing one tag per line. Tags listed here are exempt from `caption_tag_dropout_rate` (they are still shuffled when `shuffle_caption` is enabled). Each subset can use its own file.
+
+See [`train_network_advanced.md` §1.18](train_network_advanced.md#118-mixed-caption-mode-and-protected-tags--混合キャプションモードと保護タグ) for the full description, and §1.19 for `--log_captions_every_n_steps` / `--log_captions_max_length` which can be used to inspect the resulting captions during training.
 
 ## Behavior when there are duplicate subsets
 

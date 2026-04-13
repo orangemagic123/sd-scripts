@@ -508,6 +508,45 @@ Caption dropout uses the `caption_dropout_rate` setting from the dataset configu
 
 Note: Currently, only Anima supports combining `caption_dropout_rate` with text encoder output caching.
 
+#### Variant-Pool Caching for Caption Diversity / バリアントプールキャッシュ
+
+`--cache_text_encoder_outputs` normally disables `shuffle_caption`, `caption_tag_dropout_rate` and `caption_mode = "mixed"` because each image only has one cached text-encoder output. The `--cache_text_encoder_outputs_num_variants K` option works around this by **pre-generating `K` cached variants per image**, each with its own random shuffle / tag-dropout / mixed-mode selection, and at training time loading variant `epoch % K` for that image.
+
+* `--cache_text_encoder_outputs_num_variants=K` (default `0`): When `K > 0`, pre-caches `K` Qwen3 text-encoder output variants per image. Files are saved as `<image>_anima_te_v0.npz` ... `<image>_anima_te_vK-1.npz`. `K = 0` keeps the original single-cache behavior.
+* When this option is non-zero, `--cache_text_encoder_outputs_to_disk` is automatically enabled — variant caching requires a disk cache. After caching is complete the text encoder is freed from VRAM as usual.
+* `caption_dropout_rate` (full-caption dropout) is still applied at training time and is independent of the cached variants.
+* `token_warmup_step` is **not compatible** with variant caching.
+* `keep_tokens_separator` (e.g. `|||`) is correctly stripped from the caption before encoding, so the separator never reaches the text encoder.
+
+Example dataset TOML / training arguments:
+
+```toml
+cache_text_encoder_outputs = true
+cache_text_encoder_outputs_to_disk = true
+cache_text_encoder_outputs_num_variants = 10
+shuffle_caption = true
+caption_tag_dropout_rate = 0.1
+caption_mode = "mixed"
+keep_tokens_separator = "|||"
+```
+
+Approximate disk usage (≈ 8 MB per cached variant per image):
+
+| K  | 100 images | 1,000 images |
+|----|------------|--------------|
+| 5  | ~4 GB      | ~40 GB       |
+| 10 | ~8 GB      | ~80 GB       |
+
+This combines the VRAM and speed benefits of text-encoder output caching with the regularization benefits of caption shuffling, tag dropout and mixed tags/NL captions.
+
+#### Caption Modes, Protected Tags and Caption Debug Logging
+
+Anima training supports the same mixed caption mode, protected tags and caption debug logging features as the SD/SDXL trainers. See [`train_network_advanced.md` §1.18 / §1.19](train_network_advanced.md#118-mixed-caption-mode-and-protected-tags--混合キャプションモードと保護タグ) for details. Quick summary:
+
+* `--caption_mode={tags,mixed}` — `mixed` reads a second `_nl` caption file per image and randomly samples among `tags`, `nl`, `tags_nl`, `nl_tags`. Per-subset weights can be set in TOML via `mixed_weights = { tags = 1, nl = 1, tags_nl = 1, nl_tags = 1 }`.
+* `--protected_tags_file=<path>` (or per-subset TOML key `protected_tags_file`) — tags listed in this file are exempt from `caption_tag_dropout_rate`.
+* `--log_captions_every_n_steps=N` and `--log_captions_max_length=N` — logs a sampled caption (and the dropped tags / selected mixed mode) every `N` global steps. Works correctly with `--cache_text_encoder_outputs` and with the variant pool above.
+
 <details>
 <summary>日本語</summary>
 
@@ -604,6 +643,54 @@ python networks/convert_anima_lora_to_comfy.py path/to/source.safetensors path/t
 ```
 
 Using the `--reverse` option allows conversion in the opposite direction (ComfyUI format to sd-scripts format). However, reverse conversion is only possible for LoRAs converted by this script. LoRAs created with other training tools cannot be converted.
+
+### `networks/lora_tlora_anima.py` — T-LoRA for Anima
+
+T-LoRA (Timestep-dependent LoRA, AAAI 2026) is a variant of LoRA that **dynamically lowers the effective rank for noisy timesteps and uses the full rank for clean timesteps**, which helps prevent overfitting in few-shot fine-tuning. An Anima-specific implementation is provided at `networks/lora_tlora_anima.py` (and `networks/lora_tlora.py` for SD/SDXL). Flow-Matching timesteps used by Anima are supported.
+
+Example training arguments:
+
+```bash
+--network_module networks.lora_tlora_anima
+--network_dim 64
+--network_args \
+    "tlora_min_rank=1" \
+    "tlora_alpha_rank_scale=1.0" \
+    "tlora_max_timestep=1.0" \
+    "tlora_init=orthogonal" \
+    "tlora_sig_type=last"
+```
+
+Key `--network_args` (all optional):
+
+* `tlora_min_rank=N` (default `1`) — minimum effective rank used at the noisiest timestep.
+* `tlora_alpha_rank_scale=F` (default `1.0`) — exponent shaping how rank decreases with timestep. Higher values keep full rank for a larger range.
+* `tlora_max_timestep=F` (default `1.0`) — upper bound of the timestep range. For Anima Flow-Matching the default `1.0` is correct.
+* `tlora_init={kaiming,orthogonal,layer_orthogonal}` (default `kaiming`) — initialization scheme. `orthogonal` initializes Q/P with random orthogonal matrices on GPU (fast). `layer_orthogonal` performs SVD on each pretrained weight and uses its principal directions; this is slower but can give better starting points.
+* `tlora_sig_type={principal,last,middle}` (default `last`) — when `tlora_init` is `orthogonal`/`layer_orthogonal`, selects which singular values are used for initialization.
+
+The forward pre-hook on the DiT automatically captures the current timestep — no training-script changes are required.
+
+**Saving and loading.** When `tlora_init` is `orthogonal` / `layer_orthogonal`, T-LoRA modules save `q_layer` / `p_layer` / `lambda_layer` plus frozen `base_q` / `base_p` / `base_lambda_buf` instead of the standard `lora_down`/`lora_up`. ComfyUI cannot load these directly, so each save automatically writes a sibling `*_comfy.safetensors` file (see the converter below) — use the original file to resume training and the `_comfy` file for inference. T-LoRA modules trained with `tlora_init=kaiming` are already in standard LoRA format and pass through unchanged.
+
+### `networks/convert_tlora_anima_to_comfy.py` — T-LoRA → ComfyUI converter
+
+Converts an orthogonal T-LoRA Anima checkpoint into a standard rank-`2r` LoRA in ComfyUI naming. The conversion is **lossless**: the T-LoRA update `P · diag(λ) · Q − Pb · diag(λb) · Qb` is rewritten as a single `lora_down` / `lora_up` pair with `alpha = 2 · alpha_orig`.
+
+```bash
+python networks/convert_tlora_anima_to_comfy.py \
+    path/to/source_tlora.safetensors \
+    path/to/dest_comfy.safetensors \
+    [--dtype {keep,fp16,bf16,fp32}] \
+    [--sd-scripts-only]
+```
+
+Options:
+
+* `--dtype` (default `keep`) — output tensor dtype. `keep` preserves the source dtype.
+* `--sd-scripts-only` — only fuse the T-LoRA tensors back into standard `lora_down`/`lora_up`, but keep the original sd-scripts (`lora_unet_*`) key names instead of remapping them to ComfyUI naming (`diffusion_model.*` / `text_encoders.qwen3_06b.*`).
+
+This converter is used automatically by `lora_tlora_anima.py` when saving checkpoints, so you usually don't need to call it manually. It is provided as a standalone script for converting older T-LoRA checkpoints saved before the auto-conversion was added.
 
 <details>
 <summary>日本語</summary>
