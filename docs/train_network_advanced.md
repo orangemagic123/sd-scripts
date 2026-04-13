@@ -208,6 +208,108 @@ This technique involves merging a pre-trained LoRA into the base model before st
 * `--scale_weight_norms`: Scales the weight norms of the LoRA modules. This can help prevent overfitting by controlling the magnitude of the weights. A value of `1.0` is a good starting point.
 * `--disable_mmap_load_safetensors`: Disables memory-mapped loading for `.safetensors` files. This can speed up model loading in some environments like WSL.
 
+### 1.17. Network Weight EMA / ネットワーク重みのEMA
+
+An optional Exponential Moving Average (EMA) of the trained LoRA / additional-network weights can be maintained during training. The EMA copy is saved instead of the raw weights, which often produces a more stable final checkpoint.
+
+* `--ema_decay=D`: Enables EMA when set. `D` must be in the range `[0, 1)` (e.g. `0.999`). Values `>= 1.0` are rejected because the EMA either never updates (`1.0`) or diverges (`> 1.0`). When this option is omitted, EMA is disabled and the script behaves as before.
+
+Behavior when `--ema_decay` is set:
+
+* An EMA copy of the network is created at training start and updated every step with `ema = decay * ema + (1 - decay) * current`.
+* The EMA copy is used for **checkpoint saving**, **validation** (per-step and per-epoch), and **sample image generation**, so the saved file and the previews reflect the same averaged weights.
+* The EMA state is persisted with `--save_state` and restored on `--resume`, so interrupted runs do not lose accumulated averaging.
+* The decay value is recorded in the model metadata as `ss_ema_decay`.
+
+> If you only want to apply EMA after training (over a folder of already-saved per-epoch checkpoints), see the post-hoc utility `networks/ema_lora.py` in section 1.20 below.
+
+### 1.18. Mixed Caption Mode and Protected Tags / 混合キャプションモードと保護タグ
+
+LoRA training can use both tag-style (`a, b, c`) and natural-language captions and randomly mix between them, and a list of "protected" tags can be excluded from `caption_tag_dropout_rate`.
+
+* `--caption_mode={tags,mixed}` (default `tags`):
+    * `tags` keeps the existing behavior (one caption file per image).
+    * `mixed` reads two caption files per image — the standard tag caption (e.g. `image.caption`) and an additional natural-language caption with the suffix `_nl` before the extension (e.g. `image_nl.caption`). At each step, one of `tags`, `nl`, `tags_nl`, `nl_tags` is randomly selected. Sampling weights can be configured per-subset in the dataset TOML via the new `mixed_weights` key (e.g. `mixed_weights = { tags = 1, nl = 1, tags_nl = 1, nl_tags = 1 }`).
+    * The `tags`/`tags_nl`/`nl_tags` paths still honor `shuffle_caption`, `keep_tokens` / `keep_tokens_separator`, `caption_tag_dropout_rate` and `token_warmup_step`.
+* `--protected_tags_file=<path>`: Plain-text file with one tag per line. Tags listed here are exempt from `caption_tag_dropout_rate` (they are still shuffled when `shuffle_caption` is enabled). Each subset can also point to its own file via the TOML `protected_tags_file` key. The set of protected tags is logged once per epoch as `[protected tags] epoch=... file=... tags=[...]`.
+
+Both options can be set on the command line for all subsets, or per-subset in the dataset TOML file.
+
+### 1.19. Caption Debug Logging / キャプションデバッグログ
+
+These options print the actual captions and dropped tags that the dataloader produces, so you can verify shuffling, dropout, mixed-mode selection, wildcards and protected-tag handling without instrumenting the code.
+
+* `--log_captions_every_n_steps=N` (default `0`): Log a sampled caption from the current batch every `N` global steps. `0` disables the log. Captions are collected inside `__getitem__` and emitted by the training loop, so the log fires at exactly the requested global step regardless of `num_workers` or DataLoader prefetching, and is printed only once per step.
+* `--log_captions_max_length=N` (default `20`): Maximum number of tokens (comma-separated entries) to print from each sampled caption. Longer captions are truncated to keep the log readable.
+
+The log entry includes the caption mode that was selected for that sample (e.g. `tags`, `nl`, `tags_nl`, `nl_tags` when `--caption_mode=mixed`), and any tags that were dropped by `caption_tag_dropout_rate`. Caption debug logging works correctly together with `--cache_text_encoder_outputs` and the variant-pool caching described in section 1.21.
+
+### 1.20. Post-hoc EMA over Saved LoRA Checkpoints / 学習後のLoRA EMAスクリプト
+
+`networks/ema_lora.py` is a standalone utility that computes a running Exponential Moving Average over an existing sequence of LoRA checkpoints (e.g. per-epoch saves), so EMA can be applied after training without re-running the training loop.
+
+```bash
+# Folder of per-epoch checkpoints (auto-sorted in natural order)
+python networks/ema_lora.py \
+    --model_dir /path/to/A_lora_epochs \
+    --ema_decay 0.9 \
+    --save_to /path/to/A_lora_ema.safetensors
+
+# Explicit, ordered list
+python networks/ema_lora.py \
+    --models epoch1.safetensors epoch2.safetensors epoch3.safetensors \
+    --ema_decay 0.9 \
+    --save_to A_lora_ema.safetensors
+```
+
+Key options:
+
+* `--model_dir <dir>` or `--models a.safetensors b.safetensors ...`: source checkpoints. With `--model_dir`, files are sorted naturally; checkpoints whose stem contains no digit group (e.g. the final `A.safetensors` saved alongside `A-000002.safetensors` ... `A-000098.safetensors`) are pushed to the end so that the "after all numbered epochs" file is always EMA'd last.
+* `--pattern <regex>`: Optional regex filter for filenames when using `--model_dir`.
+* `--start_epoch <N>`: Apply EMA only from epoch `N` onward (inclusive). The epoch is parsed from the last digit group in each filename's stem (e.g. `A-000050.safetensors` → `50`), matching the default save layout `{output_name}-{epoch:06d}.safetensors`. Files whose stem has no digit group are always kept (they represent "after all numbered epochs"). Skipped checkpoints are listed at INFO level.
+* `--ema_decay <D>` **[required]**: EMA decay in `[0, 1)`. Larger values give more weight to older checkpoints.
+* `--save_to <path>` **[required]**: Output `.safetensors`/`.ckpt` file.
+* `--save_every_step`: Also dumps an EMA snapshot after each checkpoint, useful for inspecting the EMA trajectory.
+* `--precision {float,fp16,bf16}` (default `float`): Compute precision. `float` (fp32) is recommended to avoid accumulation error.
+* `--save_precision {float,fp16,bf16}` (optional): Save precision. **If omitted, the dtype of the source checkpoint is preserved**, so an `fp16` input produces an `fp16` output of the same size.
+
+Notes:
+
+* LoRA `alpha` scalars are copied from the latest checkpoint instead of being averaged, so the resulting LoRA still scales correctly.
+* The metadata of the last checkpoint is carried over and extended with `ss_ema_decay`, `ss_ema_source_count` and `ss_ema_sources` for traceability.
+* Shape / key mismatches across checkpoints are warned about and skipped instead of crashing.
+
+### 1.21. Variant-Pool Caching for Text Encoder Outputs / テキストエンコーダ出力のバリアントキャッシュ
+
+> Currently this option is implemented for **Anima** training (`anima_train_network.py`). See [`anima_train_network.md`](anima_train_network.md) for Anima-specific notes.
+
+`--cache_text_encoder_outputs` normally disables `shuffle_caption`, `caption_tag_dropout_rate` and `caption_mode=mixed` because each image only has one cached text-encoder output. The new `--cache_text_encoder_outputs_num_variants K` option works around this by **pre-generating `K` cached variants per image**, each with its own random shuffle / tag-dropout / mixed-mode selection, and at training time loading variant `epoch % K` for that image.
+
+* `--cache_text_encoder_outputs_num_variants=K` (default `0`): When `K > 0`, pre-caches `K` text-encoder output variants per image. Files are saved as e.g. `<image>_anima_te_v0.npz` ... `<image>_anima_te_vK-1.npz`. `K = 0` (default) keeps the original single-cache behavior.
+* When this option is non-zero, `--cache_text_encoder_outputs_to_disk` is **automatically enabled** — variant caching requires a disk cache.
+* Per-step `caption_dropout_rate` (full-caption dropout) is still applied at training time and is independent of the cached variants.
+* `token_warmup_step` is **not compatible** with variant caching, because the warmup is step-based while the variant pool is selected per-epoch.
+
+Example (Anima TOML / CLI mix):
+
+```toml
+cache_text_encoder_outputs = true
+cache_text_encoder_outputs_to_disk = true
+cache_text_encoder_outputs_num_variants = 10
+shuffle_caption = true
+caption_tag_dropout_rate = 0.1
+caption_mode = "mixed"
+```
+
+Approximate disk usage (≈ 8 MB per cached variant per image):
+
+| K  | 100 images | 1,000 images |
+|----|------------|--------------|
+| 5  | ~4 GB      | ~40 GB       |
+| 10 | ~8 GB      | ~80 GB       |
+
+This gives the VRAM and speed benefits of text-encoder output caching together with caption diversity.
+
 ## 2. Other Tips / その他のTips
 
 *   **VRAM Usage:** SDXL LoRA training requires a lot of VRAM. Even with 24GB VRAM, you might run out of memory depending on settings. Reduce VRAM usage with these settings:
