@@ -118,8 +118,20 @@ class TLoRAModule(torch.nn.Module):
         # This eliminates one elementwise kernel per adapter per forward and,
         # when r < lora_dim (high-noise timesteps), shrinks both matmuls.
         # When r == lora_dim the slicing returns a view with no copy.
+        #
+        # T-LoRA rank masking is a *training-time* regularisation. At
+        # inference we want the full-rank delta — every component is relevant
+        # because each was trained at its own timestep bracket. The reference
+        # implementation (sorryhyun/anima_lora) gates the mask on
+        # ``self.training`` for exactly this reason; the old sd-scripts port
+        # always sliced and produced degraded samples at generation time.
         r = self.lora_dim
-        if self.is_unet and self.network is not None and self.network.current_sigma_r is not None:
+        if (
+            self.training
+            and self.is_unet
+            and self.network is not None
+            and self.network.current_sigma_r is not None
+        ):
             r = min(self.lora_dim, self.network.current_sigma_r)
 
         if self.is_conv2d:
@@ -253,20 +265,46 @@ class OrthogonalTLoRAModule(torch.nn.Module):
                 self.lambda_layer.data = s[None, start_s:start_s + lora_dim].clone()
             del u, s, v, base_m
         else:
-            # Random orthogonal init: do QR on GPU (cuSOLVER) for huge speedup
-            # over per-module CPU LAPACK calls.
-            if torch.cuda.is_available():
-                init_device = torch.device("cuda")
-                q_w = torch.empty(self.q_layer.weight.shape, device=init_device)
-                p_w = torch.empty(self.p_layer.weight.shape, device=init_device)
-                torch.nn.init.orthogonal_(q_w)
-                torch.nn.init.orthogonal_(p_w)
-                self.q_layer.weight.data = q_w.to("cpu", non_blocking=False)
-                self.p_layer.weight.data = p_w.to("cpu", non_blocking=False)
-            else:
-                torch.nn.init.orthogonal_(self.q_layer.weight)
-                torch.nn.init.orthogonal_(self.p_layer.weight)
-            self.lambda_layer.data = torch.abs(torch.randn(1, lora_dim)) / math.sqrt(lora_dim)
+            # Random orthogonal init via QR decomposition of a random Gaussian
+            # matrix — Haar-distributed orthonormal bases, identical in
+            # distribution to the SVD factors of a random matrix but orders of
+            # magnitude faster than SVD for typical DiT shapes. Matches the
+            # reference anima_lora/networks/lora_modules.py OrthoLoRAModule.
+            init_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+            q_rand = torch.randn(effective_in_dim, lora_dim, device=init_device)
+            q_orth, _ = torch.linalg.qr(q_rand)  # (effective_in_dim, lora_dim)
+            self.q_layer.weight.data = q_orth.T.cpu().clone().contiguous()
+
+            p_rand = torch.randn(out_dim, lora_dim, device=init_device)
+            p_orth, _ = torch.linalg.qr(p_rand)  # (out_dim, lora_dim)
+            self.p_layer.weight.data = p_orth.cpu().clone().contiguous()
+
+            # Lambda: scale to match expected singular values of a Gaussian(0, 1/r)
+            # random matrix. Using ``torch.linspace`` bounded by those limits — and
+            # selecting the sub-range by ``sig_type`` — matches the T-LoRA
+            # reference. The previous implementation initialised lambda from
+            # ``abs(randn) / sqrt(r)``, which produced values orders of magnitude
+            # smaller than the true SV scale and caused poor training dynamics.
+            std = 1.0 / lora_dim
+            sv_max = std * (math.sqrt(effective_in_dim) + math.sqrt(out_dim))
+            sv_min = std * abs(math.sqrt(effective_in_dim) - math.sqrt(out_dim))
+            if sig_type == "principal":
+                self.lambda_layer.data = torch.linspace(
+                    sv_max, (sv_max + sv_min) / 2, lora_dim
+                ).unsqueeze(0)
+            elif sig_type == "middle":
+                mid = (sv_max + sv_min) / 2
+                spread = (sv_max - sv_min) / 4
+                self.lambda_layer.data = torch.linspace(
+                    mid + spread, mid - spread, lora_dim
+                ).unsqueeze(0)
+            else:  # "last" (default)
+                self.lambda_layer.data = torch.linspace(
+                    (sv_max + sv_min) / 2, sv_min + 1e-6, lora_dim
+                ).unsqueeze(0)
+
+            del q_rand, q_orth, p_rand, p_orth
 
         # Frozen base copies
         self.base_q = copy.deepcopy(self.q_layer)
@@ -328,9 +366,18 @@ class OrthogonalTLoRAModule(torch.nn.Module):
         # will automatically use tensor cores with the correct promotion, which
         # is much faster than running the whole adapter path in fp32.
 
-        # Get effective rank from network (set by hook); default to full rank
+        # Get effective rank from network (set by hook); default to full rank.
+        # T-LoRA timestep-dependent rank masking is a training-time
+        # regularisation — at inference we use the full rank so the learned
+        # delta matches what the reference anima_lora implementation produces
+        # (which only calls ``set_timestep_mask`` inside the training step).
         r = self.lora_dim
-        if self.is_unet and self.network is not None and self.network.current_sigma_r is not None:
+        if (
+            self.training
+            and self.is_unet
+            and self.network is not None
+            and self.network.current_sigma_r is not None
+        ):
             r = min(self.network.current_sigma_r, self.lora_dim)
 
         if self.is_conv2d:
@@ -585,11 +632,23 @@ class TLoRANetwork(torch.nn.Module):
         Anima forward: forward(self, x, timesteps, context, ...) where
         timesteps is in [0, 1] (Flow Matching).
 
-        Both adapter implementations now slice their weights to the first r
+        Both adapter implementations slice their weights to the first r
         components instead of multiplying by a 0/1 sigma_mask, so the hook
         only needs to publish ``current_sigma_r`` (a Python int). This avoids
         a per-step GPU allocation + write for the mask buffer.
+
+        NOTE: T-LoRA rank masking is a training-time regularisation only —
+        inference / sampling must use the full rank, otherwise the LoRA
+        delta is artificially attenuated at high-noise timesteps and image
+        samples come out degraded. We short-circuit here when the network
+        is not in ``training`` mode, and the adapter ``forward`` methods
+        additionally gate on ``self.training`` as a belt-and-braces check.
         """
+        if not self.training:
+            self.current_sigma_r = None
+            self.current_sigma_mask = None
+            return
+
         timestep = None
         if len(args) >= 2:
             timestep = args[1]
