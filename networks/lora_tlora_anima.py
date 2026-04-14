@@ -291,8 +291,10 @@ class OrthogonalTLoRAModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        orig_dtype = x.dtype
-        dtype = self.q_layer.weight.dtype
+        # Do NOT force-cast x to the adapter weight dtype. Under mixed-precision
+        # autocast, F.linear/conv2d with a bf16/fp16 input and an fp32 weight
+        # will automatically use tensor cores with the correct promotion, which
+        # is much faster than running the whole adapter path in fp32.
 
         # Get effective rank from network (set by hook); default to full rank
         r = self.lora_dim
@@ -306,34 +308,32 @@ class OrthogonalTLoRAModule(torch.nn.Module):
             p_weight = self.p_layer.weight[:, :r].reshape(self.p_layer.weight.shape[0], r, 1, 1)
             base_p_weight = self.base_p.weight[:, :r].reshape(self.base_p.weight.shape[0], r, 1, 1)
 
-            x_dt = x.to(dtype)
-            lx = torch.nn.functional.conv2d(x_dt, q_weight, stride=self.conv_stride, padding=self.conv_padding)
+            lx = torch.nn.functional.conv2d(x, q_weight, stride=self.conv_stride, padding=self.conv_padding)
             lx = lx * self.lambda_layer[:, :r].unsqueeze(-1).unsqueeze(-1)
             lx = torch.nn.functional.conv2d(lx, p_weight)
 
-            base_lx = torch.nn.functional.conv2d(x_dt, base_q_weight, stride=self.conv_stride, padding=self.conv_padding)
+            base_lx = torch.nn.functional.conv2d(x, base_q_weight, stride=self.conv_stride, padding=self.conv_padding)
             base_lx = base_lx * self.base_lambda_buf[:, :r].unsqueeze(-1).unsqueeze(-1)
             base_lx = torch.nn.functional.conv2d(base_lx, base_p_weight)
         else:
-            x_dt = x.to(dtype)
             # Slice weights to effective rank r instead of multiplying by mask
             q_w = self.q_layer.weight[:r]
             p_w = self.p_layer.weight[:, :r]
             lam = self.lambda_layer[:, :r]
-            lx = torch.nn.functional.linear(x_dt, q_w) * lam
+            lx = torch.nn.functional.linear(x, q_w) * lam
             lx = torch.nn.functional.linear(lx, p_w)
 
             base_q_w = self.base_q.weight[:r]
             base_p_w = self.base_p.weight[:, :r]
             base_lam = self.base_lambda_buf[:, :r]
-            base_lx = torch.nn.functional.linear(x_dt, base_q_w) * base_lam
+            base_lx = torch.nn.functional.linear(x, base_q_w) * base_lam
             base_lx = torch.nn.functional.linear(base_lx, base_p_w)
 
         result = lx - base_lx
         if self.dropout is not None and self.training:
             result = torch.nn.functional.dropout(result, p=self.dropout)
 
-        return org_forwarded + result.to(orig_dtype) * self.multiplier * self.scale
+        return org_forwarded + result * self.multiplier * self.scale
 
     @property
     def device(self):
@@ -752,6 +752,16 @@ class TLoRANetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        # nn.Module.requires_grad_(True) turns grads back ON for every parameter
+        # including the frozen base_q/base_p copies used by OrthogonalTLoRAModule.
+        # Re-freeze them so autograd does not track/accumulate unused gradients
+        # through the base branch during backward.
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if isinstance(lora, OrthogonalTLoRAModule):
+                for p in lora.base_q.parameters():
+                    p.requires_grad_(False)
+                for p in lora.base_p.parameters():
+                    p.requires_grad_(False)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()
