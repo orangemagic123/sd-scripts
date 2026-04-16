@@ -99,6 +99,7 @@ class TLoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        self.enabled = True
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -107,6 +108,9 @@ class TLoRAModule(torch.nn.Module):
 
     def forward(self, x):
         org_forwarded = self.org_forward(x)
+
+        if not self.enabled:
+            return org_forwarded
 
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
@@ -331,6 +335,7 @@ class OrthogonalTLoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        self.enabled = True
 
     def refresh_base_merge(self):
         """Recompute the cached base_p * base_lambda merge.
@@ -356,6 +361,9 @@ class OrthogonalTLoRAModule(torch.nn.Module):
 
     def forward(self, x):
         org_forwarded = self.org_forward(x)
+
+        if not self.enabled:
+            return org_forwarded
 
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
@@ -751,11 +759,16 @@ class TLoRANetwork(torch.nn.Module):
         elif isinstance(text_encoder_lr, float) or isinstance(text_encoder_lr, int):
             text_encoder_lr = [float(text_encoder_lr)]
 
-        # Enable grads on trainable params only (preserve frozen base_q/base_p)
+        # Enable grads on trainable params only (preserve frozen base_q/base_p
+        # on OrthogonalTLoRAModule; plain TLoRAModule uses lora_down/lora_up).
         for lora in self.text_encoder_loras + self.unet_loras:
-            lora.q_layer.weight.requires_grad_(True)
-            lora.p_layer.weight.requires_grad_(True)
-            lora.lambda_layer.requires_grad_(True)
+            if isinstance(lora, OrthogonalTLoRAModule):
+                lora.q_layer.weight.requires_grad_(True)
+                lora.p_layer.weight.requires_grad_(True)
+                lora.lambda_layer.requires_grad_(True)
+            else:
+                lora.lora_down.weight.requires_grad_(True)
+                lora.lora_up.weight.requires_grad_(True)
         all_params = []
         lr_descriptions = []
         # Track params already added across all groups (defensive de-dup)
