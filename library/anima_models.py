@@ -1169,6 +1169,13 @@ class Anima(nn.Module):
         for block in self.blocks:
             block.disable_gradient_checkpointing()
 
+    def compile_blocks(self, backend: str = "inductor", **compile_kwargs):
+        # Compile each block's inner _forward so gradient checkpointing (which wraps
+        # the call in eager) invokes a compiled function — the PyTorch-recommended
+        # way to combine torch.compile with activation checkpointing.
+        for block in self.blocks:
+            block._forward = torch.compile(block._forward, backend=backend, **compile_kwargs)
+
     @property
     def device(self):
         return next(self.parameters()).device

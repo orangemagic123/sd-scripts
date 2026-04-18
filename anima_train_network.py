@@ -450,8 +450,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         if self._compile_dit:
             backend = self._compile_dit_backend.lower()
-            logger.info(f"compiling Anima DiT with torch.compile(backend={backend})")
-            accelerator.unwrap_model(unet).compile(backend=backend)
+            logger.info(f"compiling Anima DiT blocks with torch.compile(backend={backend})")
+            accelerator.unwrap_model(unet).compile_blocks(backend=backend)
 
         return unet
 
