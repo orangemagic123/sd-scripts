@@ -378,8 +378,8 @@ def train(args):
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
         if compile_dit:
             backend = compile_dit_backend.lower()
-            logger.info(f"compiling Anima DiT with torch.compile(backend={backend})")
-            accelerator.unwrap_model(dit).compile(backend=backend)
+            logger.info(f"compiling Anima DiT blocks with torch.compile(backend={backend})")
+            accelerator.unwrap_model(dit).compile_blocks(backend=backend)
 
     # Move non-training models back to GPU
     if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
