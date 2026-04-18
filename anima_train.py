@@ -156,6 +156,13 @@ def train(args):
             cache_supports_dropout=True
         ), "when caching text encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
 
+    # Intercept --torch_compile so we apply torch.compile explicitly to the DiT only,
+    # instead of letting Accelerate wrap every prepared module via dynamo_backend.
+    compile_dit = bool(args.torch_compile)
+    compile_dit_backend = args.dynamo_backend
+    if compile_dit:
+        args.torch_compile = False
+
     # prepare accelerator
     logger.info("prepare accelerator")
     accelerator = train_util.prepare_accelerator(args)
@@ -356,6 +363,8 @@ def train(args):
     # clean_memory_on_device(accelerator.device)
 
     if args.deepspeed:
+        if compile_dit:
+            logger.warning("--torch_compile is ignored when --deepspeed is enabled")
         ds_model = deepspeed_utils.prepare_deepspeed_model(args, mmdit=dit)
         ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             ds_model, optimizer, train_dataloader, lr_scheduler
@@ -367,6 +376,10 @@ def train(args):
             if is_swapping_blocks:
                 accelerator.unwrap_model(dit).move_to_device_except_swap_blocks(accelerator.device)
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+        if compile_dit:
+            backend = compile_dit_backend.lower()
+            logger.info(f"compiling Anima DiT with torch.compile(backend={backend})")
+            accelerator.unwrap_model(dit).compile(backend=backend)
 
     # Move non-training models back to GPU
     if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
