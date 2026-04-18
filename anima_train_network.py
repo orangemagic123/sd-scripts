@@ -47,6 +47,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             args.fp8_base_unet = False
         args.fp8_scaled = False  # Anima DiT does not support fp8_scaled
 
+        # Intercept --torch_compile so we apply torch.compile explicitly to the DiT only,
+        # instead of letting Accelerate wrap every prepared module via dynamo_backend.
+        self._compile_dit = bool(args.torch_compile)
+        self._compile_dit_backend = args.dynamo_backend
+        if self._compile_dit:
+            args.torch_compile = False
+
         if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
             logger.warning("cache_text_encoder_outputs_to_disk is enabled, so cache_text_encoder_outputs is also enabled")
             args.cache_text_encoder_outputs = True
@@ -435,14 +442,18 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             unet.enable_gradient_checkpointing(unsloth_offload=True)
 
         if not self.is_swapping_blocks:
-            return super().prepare_unet_with_accelerator(args, accelerator, unet)
+            unet = super().prepare_unet_with_accelerator(args, accelerator, unet)
+        else:
+            unet = accelerator.prepare(unet, device_placement=[not self.is_swapping_blocks])
+            accelerator.unwrap_model(unet).move_to_device_except_swap_blocks(accelerator.device)
+            accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
-        model = unet
-        model = accelerator.prepare(model, device_placement=[not self.is_swapping_blocks])
-        accelerator.unwrap_model(model).move_to_device_except_swap_blocks(accelerator.device)
-        accelerator.unwrap_model(model).prepare_block_swap_before_forward()
+        if self._compile_dit:
+            backend = self._compile_dit_backend.lower()
+            logger.info(f"compiling Anima DiT with torch.compile(backend={backend})")
+            accelerator.unwrap_model(unet).compile(backend=backend)
 
-        return model
+        return unet
 
     def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
         if self.is_swapping_blocks:
