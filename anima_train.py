@@ -494,6 +494,12 @@ def train(args):
         for m in training_models:
             m.train()
 
+        # accumulate per-micro-batch loss across a gradient_accumulation cycle so that
+        # tensorboard logs the averaged loss once per optimizer step (matches global_step)
+        accum_loss_sum = 0.0
+        accum_loss_count = 0
+        optimizer_step_in_epoch = 0
+
         for step, batch in enumerate(train_dataloader):
             current_step.value = global_step
 
@@ -647,21 +653,29 @@ def train(args):
                         )
                 optimizer_train_fn()
 
-            current_loss = loss.detach().item()
-            if len(accelerator.trackers) > 0:
-                logs = {"loss": current_loss}
-                train_util.append_lr_to_logs_with_names(
-                    logs,
-                    lr_scheduler,
-                    args.optimizer_type,
-                    ["base", "self_attn", "cross_attn", "mlp", "mod", "llm_adapter"] if train_dit else [],
-                )
-                accelerator.log(logs, step=global_step)
+            accum_loss_sum += loss.detach().item()
+            accum_loss_count += 1
 
-            loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-            avr_loss: float = loss_recorder.moving_average
-            logs = {"avr_loss": avr_loss}
-            progress_bar.set_postfix(**logs)
+            if accelerator.sync_gradients:
+                current_loss = accum_loss_sum / accum_loss_count
+                accum_loss_sum = 0.0
+                accum_loss_count = 0
+
+                if len(accelerator.trackers) > 0:
+                    logs = {"loss": current_loss}
+                    train_util.append_lr_to_logs_with_names(
+                        logs,
+                        lr_scheduler,
+                        args.optimizer_type,
+                        ["base", "self_attn", "cross_attn", "mlp", "mod", "llm_adapter"] if train_dit else [],
+                    )
+                    accelerator.log(logs, step=global_step)
+
+                loss_recorder.add(epoch=epoch, step=optimizer_step_in_epoch, loss=current_loss)
+                optimizer_step_in_epoch += 1
+                avr_loss: float = loss_recorder.moving_average
+                logs = {"avr_loss": avr_loss}
+                progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
                 break

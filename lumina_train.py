@@ -680,6 +680,12 @@ def train(args):
         for m in training_models:
             m.train()
 
+        # accumulate per-micro-batch loss across a gradient_accumulation cycle so that
+        # tensorboard logs the averaged loss once per optimizer step (matches global_step)
+        accum_loss_sum = 0.0
+        accum_loss_count = 0
+        optimizer_step_in_epoch = 0
+
         for step, batch in enumerate(train_dataloader):
             current_step.value = global_step
 
@@ -838,19 +844,27 @@ def train(args):
                         )
                 optimizer_train_fn()
 
-            current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
-            if len(accelerator.trackers) > 0:
-                logs = {"loss": current_loss}
-                train_util.append_lr_to_logs(
-                    logs, lr_scheduler, args.optimizer_type, including_unet=True
-                )
+            accum_loss_sum += loss.detach().item()
+            accum_loss_count += 1
 
-                accelerator.log(logs, step=global_step)
+            if accelerator.sync_gradients:
+                current_loss = accum_loss_sum / accum_loss_count
+                accum_loss_sum = 0.0
+                accum_loss_count = 0
 
-            loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-            avr_loss: float = loss_recorder.moving_average
-            logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+                if len(accelerator.trackers) > 0:
+                    logs = {"loss": current_loss}
+                    train_util.append_lr_to_logs(
+                        logs, lr_scheduler, args.optimizer_type, including_unet=True
+                    )
+
+                    accelerator.log(logs, step=global_step)
+
+                loss_recorder.add(epoch=epoch, step=optimizer_step_in_epoch, loss=current_loss)
+                optimizer_step_in_epoch += 1
+                avr_loss: float = loss_recorder.moving_average
+                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
                 break

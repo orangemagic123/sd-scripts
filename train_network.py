@@ -1466,6 +1466,12 @@ class NetworkTrainer:
                 skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
                 initial_step = 1
 
+            # accumulate per-micro-batch loss across a gradient_accumulation cycle so that
+            # tensorboard logs the averaged loss once per optimizer step (matches global_step)
+            accum_loss_sum = 0.0
+            accum_loss_count = 0
+            optimizer_step_in_epoch = 0
+
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
                 current_step.value = global_step
                 if initial_step > 0:
@@ -1528,6 +1534,9 @@ class NetworkTrainer:
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
+                accum_loss_sum += loss.detach().item()
+                accum_loss_count += 1
+
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
                         args.scale_weight_norms, accelerator.device
@@ -1583,27 +1592,31 @@ class NetworkTrainer:
                                 remove_model(remove_ckpt_name)
                     optimizer_train_fn()
 
-                current_loss = loss.detach().item()
-                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-                avr_loss: float = loss_recorder.moving_average
-                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**{**max_mean_logs, **logs})
+                    current_loss = accum_loss_sum / accum_loss_count
+                    accum_loss_sum = 0.0
+                    accum_loss_count = 0
 
-                if is_tracking:
-                    logs = self.generate_step_logs(
-                        args,
-                        current_loss,
-                        avr_loss,
-                        lr_scheduler,
-                        lr_descriptions,
-                        optimizer,
-                        keys_scaled,
-                        mean_norm,
-                        maximum_norm,
-                        mean_grad_norm,
-                        mean_combined_norm,
-                    )
-                    self.step_logging(accelerator, logs, global_step, epoch + 1)
+                    loss_recorder.add(epoch=epoch, step=optimizer_step_in_epoch, loss=current_loss)
+                    optimizer_step_in_epoch += 1
+                    avr_loss: float = loss_recorder.moving_average
+                    logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                    progress_bar.set_postfix(**{**max_mean_logs, **logs})
+
+                    if is_tracking:
+                        logs = self.generate_step_logs(
+                            args,
+                            current_loss,
+                            avr_loss,
+                            lr_scheduler,
+                            lr_descriptions,
+                            optimizer,
+                            keys_scaled,
+                            mean_norm,
+                            maximum_norm,
+                            mean_grad_norm,
+                            mean_combined_norm,
+                        )
+                        self.step_logging(accelerator, logs, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
                 # for example, if validate_every_n_steps=100, validate at step 100, 200, 300, ...
