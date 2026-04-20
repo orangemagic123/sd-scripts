@@ -467,6 +467,11 @@ class BaseSubset:
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
         self.caption_mode = caption_mode
         self.mixed_weights = mixed_weights if mixed_weights is not None else {"tags": 25, "nl": 25, "tags_nl": 25, "nl_tags": 25}
+        if caption_mode == "mixed":
+            logger.info(
+                f"[subset init] image_dir={image_dir} caption_mode={caption_mode} "
+                f"mixed_weights={self.mixed_weights} (from_config={mixed_weights is not None})"
+            )
         self.protected_tags_file = protected_tags_file
         self.caption_prefix = caption_prefix
         self.caption_suffix = caption_suffix
