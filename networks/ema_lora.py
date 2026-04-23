@@ -165,7 +165,9 @@ def _detect_source_dtype(sd: dict):
     return fallback
 
 
-def _load_state_dict(file_name: str, dtype) -> Tuple[dict, dict, "torch.dtype"]:
+def _load_state_dict(
+    file_name: str, dtype, device: "torch.device" = torch.device("cpu")
+) -> Tuple[dict, dict, "torch.dtype"]:
     if os.path.splitext(file_name)[1] == ".safetensors":
         sd = load_file(file_name)
         metadata = train_util.load_metadata_from_safetensors(file_name)
@@ -175,19 +177,29 @@ def _load_state_dict(file_name: str, dtype) -> Tuple[dict, dict, "torch.dtype"]:
 
     source_dtype = _detect_source_dtype(sd)
 
-    if dtype is not None:
-        for key in list(sd.keys()):
-            if isinstance(sd[key], torch.Tensor):
-                sd[key] = sd[key].to(dtype)
+    for key in list(sd.keys()):
+        if isinstance(sd[key], torch.Tensor):
+            t = sd[key]
+            if dtype is not None:
+                t = t.to(dtype)
+            if t.device != device:
+                t = t.to(device)
+            sd[key] = t
 
     return sd, metadata, source_dtype
 
 
 def _save_state_dict(file_name: str, state_dict: dict, dtype, metadata: dict):
-    if dtype is not None:
-        for key in list(state_dict.keys()):
-            if isinstance(state_dict[key], torch.Tensor):
-                state_dict[key] = state_dict[key].to(dtype)
+    # safetensors.save_file requires CPU tensors; torch.save accepts any device
+    # but we normalize to CPU anyway so the saved file is portable.
+    for key in list(state_dict.keys()):
+        if isinstance(state_dict[key], torch.Tensor):
+            t = state_dict[key]
+            if dtype is not None:
+                t = t.to(dtype)
+            if t.device.type != "cpu":
+                t = t.detach().cpu()
+            state_dict[key] = t
 
     if os.path.splitext(file_name)[1] == ".safetensors":
         save_file(state_dict, file_name, metadata=metadata if metadata else None)
@@ -249,17 +261,18 @@ def apply_ema(
     save_to: str,
     save_every_step: bool = False,
     keep_last_metadata: bool = True,
+    device: "torch.device" = torch.device("cpu"),
 ):
     assert 0.0 <= ema_decay < 1.0, f"ema_decay must be in [0, 1), got {ema_decay}"
     assert len(models) >= 1, "need at least one checkpoint"
 
-    logger.info(f"applying EMA to {len(models)} checkpoints with decay={ema_decay}")
+    logger.info(f"applying EMA to {len(models)} checkpoints with decay={ema_decay} on device={device}")
     for i, m in enumerate(models):
         logger.info(f"  [{i}] {m}")
 
     # initialize EMA from the first checkpoint
     logger.info(f"loading initial checkpoint: {models[0]}")
-    ema_sd, first_metadata, source_dtype = _load_state_dict(models[0], compute_dtype)
+    ema_sd, first_metadata, source_dtype = _load_state_dict(models[0], compute_dtype, device)
     last_metadata = first_metadata
 
     # if the caller did not request a specific save dtype, preserve the source
@@ -276,7 +289,7 @@ def apply_ema(
 
     for step, model_path in enumerate(models[1:], start=1):
         logger.info(f"loading checkpoint [{step}]: {model_path}")
-        cur_sd, cur_metadata, _ = _load_state_dict(model_path, compute_dtype)
+        cur_sd, cur_metadata, _ = _load_state_dict(model_path, compute_dtype, device)
         last_metadata = cur_metadata if keep_last_metadata else last_metadata
 
         ema_keys = set(ema_sd.keys())
@@ -343,6 +356,22 @@ def _build_step_path(save_to: str, step: int, source_model: str) -> str:
     return f"{base}-ema-step{step:04d}-{source_stem}{ext}"
 
 
+def _resolve_device(requested: str) -> "torch.device":
+    """Turn a user-supplied device string into a torch.device, falling back
+    gracefully to CPU when CUDA was requested but is unavailable."""
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        logger.info("CUDA not available; using CPU for EMA computation")
+        return torch.device("cpu")
+
+    dev = torch.device(requested)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        logger.warning(f"requested device '{requested}' but CUDA is not available; falling back to CPU")
+        return torch.device("cpu")
+    return dev
+
+
 def run(args):
     compute_dtype = _str_to_dtype(args.precision)
     # NOTE: intentionally do NOT fall back to compute_dtype here. A None
@@ -359,6 +388,8 @@ def run(args):
 
     models = _collect_models(args)
 
+    device = _resolve_device(args.device)
+
     t0 = time.time()
     apply_ema(
         models=models,
@@ -367,6 +398,7 @@ def run(args):
         save_dtype=save_dtype,
         save_to=args.save_to,
         save_every_step=args.save_every_step,
+        device=device,
     )
     logger.info(f"done in {time.time() - t0:.1f}s")
 
@@ -446,6 +478,15 @@ def setup_parser() -> argparse.ArgumentParser:
         "checkpoints is preserved so the output file size matches the input / "
         "저장 시 정밀도. 생략 시 원본 체크포인트의 dtype을 그대로 사용하여 "
         "출력 파일 크기가 원본과 동일하게 유지됩니다",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="device used for EMA computation: 'auto' (cuda if available, else cpu), "
+        "'cuda', 'cuda:0', 'cpu', etc. Defaults to 'auto'. / "
+        "EMA 계산에 사용할 장치: 'auto'(가능하면 cuda, 아니면 cpu), 'cuda', 'cuda:0', "
+        "'cpu' 등. 기본값은 'auto'.",
     )
     return parser
 
