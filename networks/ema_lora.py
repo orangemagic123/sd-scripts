@@ -46,12 +46,13 @@ import argparse
 import os
 import re
 import time
-from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import List, Optional, Tuple
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open
+from safetensors.torch import save_file
 
-from library import train_util
 from library.utils import setup_logging
 
 setup_logging()
@@ -168,23 +169,53 @@ def _detect_source_dtype(sd: dict):
 def _load_state_dict(
     file_name: str, dtype, device: "torch.device" = torch.device("cpu")
 ) -> Tuple[dict, dict, "torch.dtype"]:
+    """Load a checkpoint directly onto ``device`` in the requested ``dtype``.
+
+    For safetensors files we stream each tensor straight to ``device`` via
+    ``safe_open``; this avoids a full CPU copy of the file and lets the dtype
+    upcast (e.g. bf16 -> float32) run on the GPU instead of saturating the
+    CPU, which was the dominant cost on network-mounted checkpoint stores.
+    """
     if os.path.splitext(file_name)[1] == ".safetensors":
-        sd = load_file(file_name)
-        metadata = train_util.load_metadata_from_safetensors(file_name)
+        # safe_open understands 'cpu', 'cuda', 'cuda:0' etc. Passing the device
+        # here causes get_tensor() to materialize straight into that device's
+        # memory — no intermediate CPU tensor, no per-tensor .to(device) hop.
+        device_str = str(device)
+        sd: dict = {}
+        source_dtype: Optional["torch.dtype"] = None
+        fallback_dtype: Optional["torch.dtype"] = None
+        with safe_open(file_name, framework="pt", device=device_str) as f:
+            metadata = f.metadata() or {}
+            for key in f.keys():
+                t = f.get_tensor(key)
+                # Track the source dtype from a representative (non-scalar)
+                # tensor; .alpha scalars are often fp32 even when weights are
+                # bf16/fp16, and we want to preserve the weight dtype on save.
+                if source_dtype is None:
+                    if t.numel() > 1:
+                        source_dtype = t.dtype
+                    elif fallback_dtype is None:
+                        fallback_dtype = t.dtype
+                if dtype is not None and t.dtype != dtype:
+                    t = t.to(dtype)
+                sd[key] = t
+        if source_dtype is None:
+            source_dtype = fallback_dtype
+        metadata = dict(metadata)
     else:
         sd = torch.load(file_name, map_location="cpu")
         metadata = {}
-
-    source_dtype = _detect_source_dtype(sd)
-
-    for key in list(sd.keys()):
-        if isinstance(sd[key], torch.Tensor):
-            t = sd[key]
-            if dtype is not None:
-                t = t.to(dtype)
-            if t.device != device:
-                t = t.to(device)
-            sd[key] = t
+        source_dtype = _detect_source_dtype(sd)
+        for key in list(sd.keys()):
+            if isinstance(sd[key], torch.Tensor):
+                t = sd[key]
+                # Combine dtype cast + device move into a single op so the
+                # runtime can fuse them (e.g. bf16 CPU -> fp32 CUDA in one hop).
+                if dtype is not None:
+                    t = t.to(device=device, dtype=dtype)
+                elif t.device != device:
+                    t = t.to(device)
+                sd[key] = t
 
     return sd, metadata, source_dtype
 
@@ -270,76 +301,117 @@ def apply_ema(
     for i, m in enumerate(models):
         logger.info(f"  [{i}] {m}")
 
-    # initialize EMA from the first checkpoint
-    logger.info(f"loading initial checkpoint: {models[0]}")
-    ema_sd, first_metadata, source_dtype = _load_state_dict(models[0], compute_dtype, device)
-    last_metadata = first_metadata
+    # Single-worker prefetch: while we're updating the running EMA with
+    # checkpoint N, the worker is already pulling checkpoint N+1 off disk
+    # (and onto `device`). For runs where the per-file load dominates — which
+    # is the usual case on network-mounted checkpoint dirs — this hides almost
+    # all of the compute behind the I/O wait.
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ema-prefetch")
+    try:
+        # initialize EMA from the first checkpoint
+        logger.info(f"loading initial checkpoint: {models[0]}")
+        t_init = time.perf_counter()
+        ema_sd, first_metadata, source_dtype = _load_state_dict(models[0], compute_dtype, device)
+        logger.info(f"  loaded initial checkpoint in {time.perf_counter() - t_init:.2f}s")
+        last_metadata = first_metadata
 
-    # if the caller did not request a specific save dtype, preserve the source
-    # dtype so the output file size matches the input files (e.g. fp16 in -> fp16 out)
-    if save_dtype is None:
-        save_dtype = source_dtype
-        logger.info(f"save_dtype not specified; using source dtype: {save_dtype}")
-
-    if save_every_step:
-        step_path = _build_step_path(save_to, 0, models[0])
-        logger.info(f"saving EMA snapshot after step 0 to: {step_path}")
-        snapshot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in ema_sd.items()}
-        _save_state_dict(step_path, snapshot, save_dtype, dict(first_metadata) if first_metadata else {})
-
-    for step, model_path in enumerate(models[1:], start=1):
-        logger.info(f"loading checkpoint [{step}]: {model_path}")
-        cur_sd, cur_metadata, _ = _load_state_dict(model_path, compute_dtype, device)
-        last_metadata = cur_metadata if keep_last_metadata else last_metadata
-
-        ema_keys = set(ema_sd.keys())
-        cur_keys = set(cur_sd.keys())
-        if ema_keys != cur_keys:
-            only_ema = ema_keys - cur_keys
-            only_cur = cur_keys - ema_keys
-            if only_ema:
-                logger.warning(
-                    f"keys present in previous EMA but missing in {os.path.basename(model_path)}: "
-                    f"{sorted(list(only_ema))[:5]}{'...' if len(only_ema) > 5 else ''}"
-                )
-            if only_cur:
-                logger.warning(
-                    f"new keys in {os.path.basename(model_path)} not present in previous EMA: "
-                    f"{sorted(list(only_cur))[:5]}{'...' if len(only_cur) > 5 else ''}"
-                )
-
-        for key in cur_keys:
-            cur_val = cur_sd[key]
-            if not isinstance(cur_val, torch.Tensor):
-                ema_sd[key] = cur_val
-                continue
-
-            if _is_non_ema_key(key):
-                # alpha etc. — just copy the latest value
-                ema_sd[key] = cur_val
-                continue
-
-            if key not in ema_sd:
-                # new tensor appearing mid-sequence; initialize from this checkpoint
-                ema_sd[key] = cur_val.clone()
-                continue
-
-            prev = ema_sd[key]
-            if prev.shape != cur_val.shape:
-                logger.warning(
-                    f"shape mismatch for key {key}: {tuple(prev.shape)} vs {tuple(cur_val.shape)}, "
-                    f"replacing with current checkpoint"
-                )
-                ema_sd[key] = cur_val.clone()
-                continue
-
-            ema_sd[key] = prev * ema_decay + cur_val * (1.0 - ema_decay)
+        # if the caller did not request a specific save dtype, preserve the source
+        # dtype so the output file size matches the input files (e.g. fp16 in -> fp16 out)
+        if save_dtype is None:
+            save_dtype = source_dtype
+            logger.info(f"save_dtype not specified; using source dtype: {save_dtype}")
 
         if save_every_step:
-            step_path = _build_step_path(save_to, step, model_path)
-            logger.info(f"saving EMA snapshot after step {step} to: {step_path}")
+            step_path = _build_step_path(save_to, 0, models[0])
+            logger.info(f"saving EMA snapshot after step 0 to: {step_path}")
             snapshot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in ema_sd.items()}
-            _save_state_dict(step_path, snapshot, save_dtype, dict(last_metadata) if last_metadata else {})
+            _save_state_dict(step_path, snapshot, save_dtype, dict(first_metadata) if first_metadata else {})
+
+        # Kick off the first prefetch so the worker overlaps with setup above
+        # (and with any subsequent compute).
+        pending: Optional[Future] = None
+        if len(models) > 1:
+            pending = executor.submit(_load_state_dict, models[1], compute_dtype, device)
+
+        for step, model_path in enumerate(models[1:], start=1):
+            logger.info(f"loading checkpoint [{step}]: {model_path}")
+            t_load = time.perf_counter()
+            assert pending is not None
+            cur_sd, cur_metadata, _ = pending.result()
+            load_wait = time.perf_counter() - t_load
+            # Queue the next file before we start computing on the current one
+            # so its disk read runs in parallel with our EMA update.
+            if step + 1 < len(models):
+                pending = executor.submit(_load_state_dict, models[step + 1], compute_dtype, device)
+            else:
+                pending = None
+
+            last_metadata = cur_metadata if keep_last_metadata else last_metadata
+
+            ema_keys = set(ema_sd.keys())
+            cur_keys = set(cur_sd.keys())
+            if ema_keys != cur_keys:
+                only_ema = ema_keys - cur_keys
+                only_cur = cur_keys - ema_keys
+                if only_ema:
+                    logger.warning(
+                        f"keys present in previous EMA but missing in {os.path.basename(model_path)}: "
+                        f"{sorted(list(only_ema))[:5]}{'...' if len(only_ema) > 5 else ''}"
+                    )
+                if only_cur:
+                    logger.warning(
+                        f"new keys in {os.path.basename(model_path)} not present in previous EMA: "
+                        f"{sorted(list(only_cur))[:5]}{'...' if len(only_cur) > 5 else ''}"
+                    )
+
+            t_compute = time.perf_counter()
+            for key in cur_keys:
+                cur_val = cur_sd[key]
+                if not isinstance(cur_val, torch.Tensor):
+                    ema_sd[key] = cur_val
+                    continue
+
+                if _is_non_ema_key(key):
+                    # alpha etc. — just copy the latest value
+                    ema_sd[key] = cur_val
+                    continue
+
+                if key not in ema_sd:
+                    # new tensor appearing mid-sequence; initialize from this checkpoint
+                    ema_sd[key] = cur_val.clone()
+                    continue
+
+                prev = ema_sd[key]
+                if prev.shape != cur_val.shape:
+                    logger.warning(
+                        f"shape mismatch for key {key}: {tuple(prev.shape)} vs {tuple(cur_val.shape)}, "
+                        f"replacing with current checkpoint"
+                    )
+                    ema_sd[key] = cur_val.clone()
+                    continue
+
+                # In-place EMA update: `prev.mul_(d).add_(cur, alpha=1-d)` avoids
+                # allocating a fresh output tensor for every key, which for LoRA
+                # checkpoints with thousands of small tensors otherwise means
+                # thousands of extra allocator/kernel-launch round trips.
+                prev.mul_(ema_decay).add_(cur_val, alpha=1.0 - ema_decay)
+
+            compute_elapsed = time.perf_counter() - t_compute
+            # Release references to the consumed checkpoint's tensors before
+            # the next iteration so peak memory stays at roughly 2x a single
+            # checkpoint (ema_sd + one prefetched sd) rather than 3x.
+            del cur_sd
+            logger.info(
+                f"  step {step}: load_wait={load_wait:.2f}s compute={compute_elapsed:.2f}s"
+            )
+
+            if save_every_step:
+                step_path = _build_step_path(save_to, step, model_path)
+                logger.info(f"saving EMA snapshot after step {step} to: {step_path}")
+                snapshot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in ema_sd.items()}
+                _save_state_dict(step_path, snapshot, save_dtype, dict(last_metadata) if last_metadata else {})
+    finally:
+        executor.shutdown(wait=True)
 
     metadata = dict(last_metadata) if last_metadata else {}
     metadata["ss_ema_decay"] = str(ema_decay)
