@@ -437,6 +437,7 @@ class BaseSubset:
         caption_dropout_rate: float,
         caption_dropout_every_n_epochs: int,
         caption_tag_dropout_rate: float,
+        special_caption_tag_dropout_rate: float,
         caption_mode: str,
         mixed_weights: Optional[Dict[str, int]],
         protected_tags_file: Optional[str],
@@ -465,6 +466,7 @@ class BaseSubset:
         self.caption_dropout_rate = caption_dropout_rate
         self.caption_dropout_every_n_epochs = caption_dropout_every_n_epochs
         self.caption_tag_dropout_rate = caption_tag_dropout_rate
+        self.special_caption_tag_dropout_rate = special_caption_tag_dropout_rate
         self.caption_mode = caption_mode
         self.mixed_weights = mixed_weights if mixed_weights is not None else {"tags": 25, "nl": 25, "tags_nl": 25, "nl_tags": 25}
         if caption_mode == "mixed":
@@ -512,6 +514,7 @@ class DreamBoothSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        special_caption_tag_dropout_rate,
         caption_mode,
         mixed_weights,
         protected_tags_file,
@@ -543,6 +546,7 @@ class DreamBoothSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            special_caption_tag_dropout_rate,
             caption_mode,
             mixed_weights,
             protected_tags_file,
@@ -589,6 +593,7 @@ class FineTuningSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        special_caption_tag_dropout_rate,
         caption_mode,
         mixed_weights,
         protected_tags_file,
@@ -620,6 +625,7 @@ class FineTuningSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            special_caption_tag_dropout_rate,
             caption_mode,
             mixed_weights,
             protected_tags_file,
@@ -662,6 +668,7 @@ class ControlNetSubset(BaseSubset):
         caption_dropout_rate,
         caption_dropout_every_n_epochs,
         caption_tag_dropout_rate,
+        special_caption_tag_dropout_rate,
         caption_mode,
         mixed_weights,
         protected_tags_file,
@@ -693,6 +700,7 @@ class ControlNetSubset(BaseSubset):
             caption_dropout_rate,
             caption_dropout_every_n_epochs,
             caption_tag_dropout_rate,
+            special_caption_tag_dropout_rate,
             caption_mode,
             mixed_weights,
             protected_tags_file,
@@ -903,8 +911,14 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def _process_tag_caption(self, subset: BaseSubset, caption: str):
         dropped_tags = []
-        if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
-            fixed_tokens = []
+        fixed_tokens: List[str] = []
+        special_dropout_rate = getattr(subset, "special_caption_tag_dropout_rate", 0.0) or 0.0
+        if (
+            subset.shuffle_caption
+            or subset.token_warmup_step > 0
+            or subset.caption_tag_dropout_rate > 0
+            or special_dropout_rate > 0
+        ):
             flex_tokens = []
             fixed_suffix_tokens = []
             if (
@@ -948,6 +962,21 @@ class BaseDataset(torch.utils.data.Dataset):
                         dropped_tags.append(token)
                 flex_tokens = kept
 
+            if special_dropout_rate > 0 and (fixed_tokens or fixed_suffix_tokens):
+                protected_tags = self._get_protected_tags(subset)
+
+                def _drop_fixed(tokens):
+                    kept_fixed = []
+                    for token in tokens:
+                        if token in protected_tags or random.random() >= special_dropout_rate:
+                            kept_fixed.append(token)
+                        else:
+                            dropped_tags.append(token)
+                    return kept_fixed
+
+                fixed_tokens = _drop_fixed(fixed_tokens)
+                fixed_suffix_tokens = _drop_fixed(fixed_suffix_tokens)
+
             caption = subset.caption_separator.join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
         elif (
             hasattr(subset, "keep_tokens_separator")
@@ -961,7 +990,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 all_tokens.extend([t.strip() for t in part.split(subset.caption_separator) if t.strip()])
             caption = subset.caption_separator.join(all_tokens)
 
-        return caption, dropped_tags
+        return caption, dropped_tags, fixed_tokens
 
     def process_caption(
         self, subset: BaseSubset, caption: str, caption_nl: Optional[str] = None, skip_caption_dropout: bool = False
@@ -1015,14 +1044,20 @@ class BaseDataset(torch.utils.data.Dataset):
             else:
                 # if caption is multiline, use the first line
                 caption = caption.split("\n")[0]
-            tag_caption, dropped_tags = self._process_tag_caption(subset, caption)
+            tag_caption, dropped_tags, processed_fixed_tokens = self._process_tag_caption(subset, caption)
             selected_mode = "tags"
 
             if subset.caption_mode == "mixed" and caption_nl:
                 nl_caption = caption_nl.split("\n")[0] if "\n" in caption_nl else caption_nl
-                fixed_prefix = []
-                if subset.keep_tokens_separator and subset.keep_tokens_separator in caption:
-                    fixed_prefix = [t.strip() for t in caption.split(subset.keep_tokens_separator, 1)[0].split(subset.caption_separator) if t.strip()]
+                special_dropout_rate = getattr(subset, "special_caption_tag_dropout_rate", 0.0) or 0.0
+                if special_dropout_rate > 0:
+                    # Reflect special_caption_tag_dropout_rate in all mixed caption modes
+                    # by using the post-processing fixed tokens as the prefix.
+                    fixed_prefix = list(processed_fixed_tokens)
+                else:
+                    fixed_prefix = []
+                    if subset.keep_tokens_separator and subset.keep_tokens_separator in caption:
+                        fixed_prefix = [t.strip() for t in caption.split(subset.keep_tokens_separator, 1)[0].split(subset.caption_separator) if t.strip()]
 
                 modes = ["tags", "nl", "tags_nl", "nl_tags"]
                 weights = [float(subset.mixed_weights.get(mode, 0)) for mode in modes]
@@ -1239,6 +1274,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     or subset.shuffle_caption
                     or subset.token_warmup_step > 0
                     or subset.caption_tag_dropout_rate > 0
+                    or getattr(subset, "special_caption_tag_dropout_rate", 0.0) > 0
                     or subset.caption_mode == "mixed"
                 )
                 for subset in self.subsets
@@ -2745,6 +2781,7 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_dropout_rate,
                 subset.caption_dropout_every_n_epochs,
                 subset.caption_tag_dropout_rate,
+                subset.special_caption_tag_dropout_rate,
                 subset.caption_prefix,
                 subset.caption_suffix,
                 subset.token_warmup_min,
@@ -5045,6 +5082,16 @@ def add_dataset_arguments(
             type=float,
             default=0.0,
             help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
+        )
+        parser.add_argument(
+            "--special_caption_tag_dropout_rate",
+            type=float,
+            default=0.0,
+            help="Rate of dropout for fixed (kept) tokens delimited by --keep_tokens_separator or --keep_tokens (0.0~1.0)."
+            " Applied independently from --caption_tag_dropout_rate; the fixed portion is not shuffled and"
+            " stays at the front of every caption_mode."
+            " / --keep_tokens_separatorまたは--keep_tokensで指定された固定タグをdropoutする割合（0.0~1.0）。"
+            "--caption_tag_dropout_rateとは独立に適用され、固定部分はシャッフルされず全caption_modeで先頭に残ります。",
         )
 
     if support_dreambooth:

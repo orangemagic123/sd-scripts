@@ -70,6 +70,7 @@ class BaseSubsetParams:
     caption_dropout_rate: float = 0.0
     caption_dropout_every_n_epochs: int = 0
     caption_tag_dropout_rate: float = 0.0
+    special_caption_tag_dropout_rate: float = 0.0
     caption_mode: str = "tags"
     mixed_weights: Optional[Dict[str, int]] = None
     protected_tags_file: Optional[str] = None
@@ -208,6 +209,7 @@ class ConfigSanitizer:
         "caption_dropout_every_n_epochs": int,
         "caption_dropout_rate": Any(float, int),
         "caption_tag_dropout_rate": Any(float, int),
+        "special_caption_tag_dropout_rate": Any(float, int),
         "caption_mode": str,
         "mixed_weights": dict,
         "protected_tags_file": str,
@@ -563,6 +565,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     caption_dropout_rate: {subset.caption_dropout_rate}
                     caption_dropout_every_n_epochs: {subset.caption_dropout_every_n_epochs}
                     caption_tag_dropout_rate: {subset.caption_tag_dropout_rate}
+                    special_caption_tag_dropout_rate: {subset.special_caption_tag_dropout_rate}
                     caption_prefix: {subset.caption_prefix}
                     caption_suffix: {subset.caption_suffix}
                     color_aug: {subset.color_aug}
