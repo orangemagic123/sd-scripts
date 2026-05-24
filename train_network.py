@@ -55,6 +55,30 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _build_caption_metadata(train_dataset_group):
+    caption_modes = []
+    mixed_weights = []
+
+    for dataset in getattr(train_dataset_group, "datasets", []):
+        for subset in getattr(dataset, "subsets", []):
+            caption_mode = getattr(subset, "caption_mode", None)
+            if caption_mode is not None and caption_mode not in caption_modes:
+                caption_modes.append(caption_mode)
+
+            if caption_mode == "mixed":
+                subset_mixed_weights = getattr(subset, "mixed_weights", None)
+                if subset_mixed_weights is not None and subset_mixed_weights not in mixed_weights:
+                    mixed_weights.append(subset_mixed_weights)
+
+    metadata = {}
+    if caption_modes:
+        metadata["ss_caption_mode"] = caption_modes[0] if len(caption_modes) == 1 else json.dumps(caption_modes)
+    if mixed_weights:
+        metadata["ss_mixed_weights"] = json.dumps(mixed_weights[0] if len(mixed_weights) == 1 else mixed_weights)
+
+    return metadata
+
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -1064,6 +1088,8 @@ class NetworkTrainer:
             "ss_ema_decay": args.ema_decay,
         }
 
+        metadata.update(_build_caption_metadata(train_dataset_group))
+
         self.update_metadata(metadata, args)  # architecture specific metadata
 
         if use_user_config:
@@ -1106,8 +1132,11 @@ class NetworkTrainer:
                         "enable_wildcard": bool(subset.enable_wildcard),
                         "caption_prefix": subset.caption_prefix,
                         "caption_suffix": subset.caption_suffix,
+                        "caption_mode": subset.caption_mode,
                         "resize_interpolation": subset.resize_interpolation,
                     }
+                    if subset.caption_mode == "mixed":
+                        subset_metadata["mixed_weights"] = subset.mixed_weights
 
                     image_dir_or_metadata_file = None
                     if subset.image_dir:
@@ -1188,6 +1217,7 @@ class NetworkTrainer:
                     "ss_flip_aug": bool(args.flip_aug),
                     "ss_random_crop": bool(args.random_crop),
                     "ss_shuffle_caption": bool(args.shuffle_caption),
+                    "ss_caption_mode": args.caption_mode,
                     "ss_enable_bucket": bool(dataset.enable_bucket),
                     "ss_bucket_no_upscale": bool(dataset.bucket_no_upscale),
                     "ss_min_bucket_reso": dataset.min_bucket_reso,

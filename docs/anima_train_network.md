@@ -721,6 +721,8 @@ The following metadata is saved in the LoRA model file:
 * `ss_timestep_sampling`
 * `ss_sigmoid_scale`
 * `ss_discrete_flow_shift`
+* `ss_caption_mode`
+* `ss_mixed_weights`
 
 <details>
 <summary>日本語</summary>
@@ -738,5 +740,7 @@ The following metadata is saved in the LoRA model file:
 * `ss_timestep_sampling`
 * `ss_sigmoid_scale`
 * `ss_discrete_flow_shift`
+* `ss_caption_mode`
+* `ss_mixed_weights`
 
 </details>
