@@ -22,7 +22,14 @@ init_ipex()
 from accelerate.utils import set_seed
 from library import deepspeed_utils, anima_models, anima_train_utils, anima_utils, strategy_base, strategy_anima, sai_model_spec
 
-import library.train_util as train_util
+import library.accelerator_setup as accelerator_setup
+import library.args as args_util
+import library.dataset as dataset_util
+import library.optimizer as optimizer_util
+import library.logging_util as logging_util
+import library.loss as loss_util
+import library.checkpoint_io as checkpoint_io
+import library.sampling as sampling
 
 from library.utils import setup_logging, add_logging_arguments
 
@@ -41,10 +48,12 @@ from library.custom_train_functions import apply_masked_loss, add_custom_train_a
 
 
 def train(args):
-    train_util.verify_training_args(args)
-    train_util.prepare_dataset_args(args, True)
+    args_util.verify_training_args(args)
+    accelerator_setup.prepare_dataset_args(args, True)
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
+
+    flux_train_utils.log_timestep_sampling_info(args)
 
     # backward compatibility
     if not args.skip_cache_check:
@@ -124,13 +133,13 @@ def train(args):
         blueprint = blueprint_generator.generate(user_config, args)
         train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     else:
-        train_dataset_group = train_util.load_arbitrary_dataset(args)
+        train_dataset_group = dataset_util.load_arbitrary_dataset(args)
         val_dataset_group = None
 
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
     ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
-    collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
+    collator = dataset_util.collator_class(current_epoch, current_step, ds_for_collator)
 
     train_dataset_group.verify_bucket_reso_steps(16)  # Qwen-Image VAE spatial downscale = 8 * patch size = 2
 
@@ -142,7 +151,7 @@ def train(args):
                 )
             )
         train_dataset_group.set_current_strategies()
-        train_util.debug_dataset(train_dataset_group, True)
+        dataset_util.debug_dataset(train_dataset_group, True)
         return
     if len(train_dataset_group) == 0:
         logger.error("No data found. Please verify the metadata file and train_data_dir option.")
@@ -156,19 +165,12 @@ def train(args):
             cache_supports_dropout=True
         ), "when caching text encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
 
-    # Intercept --torch_compile so we apply torch.compile explicitly to the DiT only,
-    # instead of letting Accelerate wrap every prepared module via dynamo_backend.
-    compile_dit = bool(args.torch_compile)
-    compile_dit_backend = args.dynamo_backend
-    if compile_dit:
-        args.torch_compile = False
-
     # prepare accelerator
     logger.info("prepare accelerator")
-    accelerator = train_util.prepare_accelerator(args)
+    accelerator = accelerator_setup.prepare_accelerator(args)
 
     # mixed precision dtype
-    weight_dtype, save_dtype = train_util.prepare_dtype(args)
+    weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
 
     # Load tokenizers and set strategies
     logger.info("Loading tokenizers...")
@@ -208,7 +210,7 @@ def train(args):
         # cache sample prompt embeddings
         if args.sample_prompts is not None:
             logger.info(f"Cache Text Encoder outputs for sample prompts: {args.sample_prompts}")
-            prompts = train_util.load_prompts(args.sample_prompts)
+            prompts = sampling.load_prompts(args.sample_prompts)
             sample_prompts_te_outputs = {}
             with accelerator.autocast(), torch.no_grad():
                 for prompt_dict in prompts:
@@ -229,9 +231,7 @@ def train(args):
 
     # Load VAE and cache latents
     logger.info("Loading Anima VAE...")
-    vae = qwen_image_autoencoder_kl.load_vae(
-        args.vae, device="cpu", disable_mmap=True, spatial_chunk_size=args.vae_chunk_size, disable_cache=args.vae_disable_cache
-    )
+    vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
 
     if cache_latents:
         vae.to(accelerator.device, dtype=weight_dtype)
@@ -305,11 +305,11 @@ def train(args):
 
     if args.fused_backward_pass:
         # Pass per-component param_groups directly to preserve per-component LRs
-        _, _, optimizer = train_util.get_optimizer(args, trainable_params=param_groups)
-        optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
+        _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=param_groups)
+        optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
     else:
-        _, _, optimizer = train_util.get_optimizer(args, trainable_params=param_groups)
-        optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
+        _, _, optimizer = optimizer_util.get_optimizer(args, trainable_params=param_groups)
+        optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
 
     # prepare dataloader
     train_dataset_group.set_current_strategies()
@@ -334,7 +334,7 @@ def train(args):
     train_dataset_group.set_max_train_steps(args.max_train_steps)
 
     # lr scheduler
-    lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+    lr_scheduler = optimizer_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
     # full fp16/bf16 training
     dit_weight_dtype = weight_dtype
@@ -363,8 +363,6 @@ def train(args):
     # clean_memory_on_device(accelerator.device)
 
     if args.deepspeed:
-        if compile_dit:
-            logger.warning("--torch_compile is ignored when --deepspeed is enabled")
         ds_model = deepspeed_utils.prepare_deepspeed_model(args, mmdit=dit)
         ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             ds_model, optimizer, train_dataloader, lr_scheduler
@@ -376,10 +374,6 @@ def train(args):
             if is_swapping_blocks:
                 accelerator.unwrap_model(dit).move_to_device_except_swap_blocks(accelerator.device)
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
-        if compile_dit:
-            backend = compile_dit_backend.lower()
-            logger.info(f"compiling Anima DiT blocks with torch.compile(backend={backend})")
-            accelerator.unwrap_model(dit).compile_blocks(backend=backend)
 
     # Move non-training models back to GPU
     if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
@@ -388,10 +382,10 @@ def train(args):
         vae.to(accelerator.device, dtype=weight_dtype)
 
     if args.full_fp16:
-        train_util.patch_accelerator_for_fp16_training(accelerator)
+        accelerator_setup.patch_accelerator_for_fp16_training(accelerator)
 
     # resume
-    train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+    args_util.resume_from_local_or_hf_if_specified(accelerator, args)
 
     if args.fused_backward_pass:
         # use fused optimizer for backward pass: other optimizers will be supported in the future
@@ -445,7 +439,7 @@ def train(args):
             init_kwargs = toml.load(args.log_tracker_config)
         accelerator.init_trackers(
             "finetuning" if args.log_tracker_name is None else args.log_tracker_name,
-            config=train_util.get_sanitized_config_or_none(args),
+            config=args_util.get_sanitized_config_or_none(args),
             init_kwargs=init_kwargs,
         )
 
@@ -485,7 +479,7 @@ def train(args):
     if vae is not None:
         logger.info(f"vae device: {vae.device}")
 
-    loss_recorder = train_util.LossRecorder()
+    loss_recorder = logging_util.LossRecorder()
     epoch = 0
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -494,8 +488,8 @@ def train(args):
         for m in training_models:
             m.train()
 
-        # accumulate per-micro-batch loss across a gradient_accumulation cycle so that
-        # tensorboard logs the averaged loss once per optimizer step (matches global_step)
+        # Log one averaged loss value per optimizer step when gradient
+        # accumulation is enabled. global_step only advances on these steps.
         accum_loss_sum = 0.0
         accum_loss_count = 0
         optimizer_step_in_epoch = 0
@@ -589,8 +583,8 @@ def train(args):
                 )
 
                 # Loss
-                huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, None)
-                loss = train_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
+                loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
                 if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                     loss = apply_masked_loss(loss, batch)
                 loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
@@ -663,7 +657,7 @@ def train(args):
 
                 if len(accelerator.trackers) > 0:
                     logs = {"loss": current_loss}
-                    train_util.append_lr_to_logs_with_names(
+                    optimizer_util.append_lr_to_logs_with_names(
                         logs,
                         lr_scheduler,
                         args.optimizer_type,
@@ -674,8 +668,7 @@ def train(args):
                 loss_recorder.add(epoch=epoch, step=optimizer_step_in_epoch, loss=current_loss)
                 optimizer_step_in_epoch += 1
                 avr_loss: float = loss_recorder.moving_average
-                logs = {"avr_loss": avr_loss}
-                progress_bar.set_postfix(**logs)
+                progress_bar.set_postfix(avr_loss=avr_loss)
 
             if global_step >= args.max_train_steps:
                 break
@@ -721,7 +714,7 @@ def train(args):
     optimizer_eval_fn()
 
     if args.save_state or args.save_state_on_train_end:
-        train_util.save_state_on_train_end(args, accelerator)
+        checkpoint_io.save_state_on_train_end(args, accelerator)
 
     del accelerator
 
@@ -740,16 +733,16 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     add_logging_arguments(parser)
-    train_util.add_sd_models_arguments(parser)
-    train_util.add_dataset_arguments(parser, True, True, True)
-    train_util.add_training_arguments(parser, False)
-    train_util.add_masked_loss_arguments(parser)
+    args_util.add_sd_models_arguments(parser)
+    args_util.add_dataset_arguments(parser, True, True, True)
+    args_util.add_training_arguments(parser, False)
+    args_util.add_masked_loss_arguments(parser)
     deepspeed_utils.add_deepspeed_arguments(parser)
-    train_util.add_sd_saving_arguments(parser)
-    train_util.add_optimizer_arguments(parser)
+    args_util.add_sd_saving_arguments(parser)
+    args_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     add_custom_train_arguments(parser)
-    train_util.add_dit_training_arguments(parser)
+    args_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
     sai_model_spec.add_model_spec_arguments(parser)
 
@@ -777,10 +770,13 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    train_util.verify_command_line_training_args(args)
-    args = train_util.read_config_from_file(args, parser)
+    args_util.verify_command_line_training_args(args)
+    args = args_util.read_config_from_file(args, parser)
 
     if args.attn_mode == "sdpa":
         args.attn_mode = "torch"  # backward compatibility
 
-    train(args)
+    if args.show_timesteps:
+        anima_train_utils.show_timesteps(args)
+    else:
+        train(args)

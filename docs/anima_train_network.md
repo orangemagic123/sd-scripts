@@ -137,7 +137,7 @@ The learning rate of `1e-4` is just an example. Adjust it according to your data
 
 If loss becomes NaN, ensure you are using PyTorch version 2.5 or higher.
 
-**Note:** `--vae_chunk_size` and `--vae_disable_cache` are custom options in this repository to reduce memory usage of the Qwen-Image VAE.
+**Note:** `--vae_chunk_size`, `--vae_disable_cache`, and `--qwen_image_vae_2d` are custom options in this repository to reduce memory usage (and, for `--qwen_image_vae_2d`, also speed up) the Qwen-Image VAE.
 
 <details>
 <summary>日本語</summary>
@@ -152,7 +152,7 @@ If loss becomes NaN, ensure you are using PyTorch version 2.5 or higher.
 
 lossがNaNになる場合は、PyTorchのバージョンが2.5以上であることを確認してください。
 
-注意: `--vae_chunk_size`および`--vae_disable_cache`は当リポジトリ独自のオプションで、Qwen-Image VAEのメモリ使用量を削減するために使用します。
+注意: `--vae_chunk_size`、`--vae_disable_cache`、`--qwen_image_vae_2d`は当リポジトリ独自のオプションで、Qwen-Image VAEのメモリ使用量を削減するために使用します（`--qwen_image_vae_2d`は高速化も兼ねます）。
 
 </details>
 
@@ -225,7 +225,11 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
   - Chunk size for Qwen-Image VAE processing. Reduces VRAM usage at the cost of speed. Default is no chunking.
 * `--vae_disable_cache`
   - Disable internal caching in Qwen-Image VAE to reduce VRAM usage.
-  
+* `--compile` and related options
+  - Speed up training with per-block `torch.compile`. See the [torch.compile for Anima guide](anima_torch_compile.md) for details.
+* `--qwen_image_vae_2d`
+  - Use the image-only 2D Qwen-Image VAE. The official (3D causal Conv3d) VAE weights are converted to equivalent 2D convolutions on load, so no separate weight file is needed and, for single images, the latents are numerically equivalent to the default 3D VAE. This is roughly 2x faster and uses about 1/3 of the peak VRAM for encode/decode (e.g., about 4.4 GB / 7.7 s -> about 1.4 GB / 4.5 s for 10 images at 1024x1024 on an RTX 3090). Recommended for latent caching. Note: with the 2D VAE the peak memory is dominated by full-resolution activations and the mid-block attention, so `--vae_chunk_size` has little further effect on the peak, and `--vae_disable_cache` is a no-op (the 2D VAE has no temporal cache).
+
 #### Incompatible or Unsupported Options / 非互換・非サポートの引数
 
 * `--v2`, `--v_parameterization`, `--clip_skip` - Options for Stable Diffusion v1/v2 that are not used for Anima training.
@@ -277,6 +281,7 @@ LoRA学習の場合は、`--network_args`の`network_reg_lrs`を使用してく�
 * `--cache_latents`, `--cache_latents_to_disk` - Qwen-Image VAEの出力をキャッシュ。
 * `--vae_chunk_size` - Qwen-Image VAEのチャンク処理サイズ。メモリ使用量を削減しますが速度が低下します。デフォルトはチャンク処理なし。
 * `--vae_disable_cache` - Qwen-Image VAEの内部キャッシュを無効化してメモリ使用量を削減します。
+* `--qwen_image_vae_2d` - 画像専用の2D Qwen-Image VAEを使用します。公式（3D causal Conv3d）のVAE重みをロード時に等価な2D畳み込みへ変換するため、専用の重みファイルは不要で、単一画像では出力（latent）がデフォルトの3D VAEと数値的に一致します。encode/decodeが約2倍高速で、ピークVRAMが約1/3になります（RTX 3090・1024x1024・10枚で約4.4GB/7.7秒→約1.4GB/4.5秒）。latentキャッシュ用途に推奨です。注意: 2D VAEではピークメモリがフル解像度のアクティベーションやmid-blockのattentionに移るため、`--vae_chunk_size`のピークへの追加効果は小さく、また`--vae_disable_cache`は無効です（2D VAEに時間方向のキャッシュは無いため）。
 
 #### 非互換・非サポートの引数
 
@@ -500,6 +505,19 @@ The `--weighting_scheme` option specifies loss weighting by timestep:
 - `none`: Same as uniform.
 - `logit_normal`, `mode`: Additional schemes from SD3 training. See the [`sd3_train_network.md` guide](sd3_train_network.md) for details.
 
+#### Visualizing the Timestep Distribution
+
+To check how the above settings actually affect the sampled timesteps, two features are available (both shared with FLUX training):
+
+* **Training log:** At the start of every run, a one-line summary of the timestep sampling configuration is logged. It explicitly states whether `--discrete_flow_shift` is applied for the chosen `--timestep_sampling` (only `sigma` and `shift` use it; with `sigmoid`, `uniform`, or `flux_shift` it is **ignored**). This makes it easy to notice when a shift value you set has no effect.
+* `--show_timesteps=<console|image>`: Visualize the *actual* sampled-timestep distribution and the loss weighting for the current settings, then exit without training. `console` prints an ASCII histogram; `image` shows a matplotlib plot (requires `matplotlib`). The distribution is shown from noisy (top / left, t=1000) to clean (bottom / right, t=0).
+* `--show_timesteps_resolution=<H | H,W>`: Image resolution (in pixels) assumed by `--show_timesteps` for resolution-dependent sampling such as `flux_shift`. A single value is used for both height and width; two comma-separated values are `H,W` (`W,H` gives the same result). Default `1024`. This is useful because the `--resolution` argument is `None` when the dataset is configured via a `.toml` file.
+
+Example:
+```
+--show_timesteps console --show_timesteps_resolution 1024
+```
+
 #### Caption Dropout
 
 Caption dropout uses the `caption_dropout_rate` setting from the dataset configuration (per-subset in TOML). When using `--cache_text_encoder_outputs`, the dropout rate is stored with each cached entry and applied during training, so caption dropout is compatible with text encoder output caching.
@@ -569,6 +587,14 @@ Anima training supports the same mixed caption mode, protected tags and caption 
 #### 損失の重み付け
 
 `--weighting_scheme`でタイムステップごとの損失の重み付けを指定します。
+
+#### タイムステップ分布の可視化
+
+上記の設定が実際のタイムステップにどう影響するかを確認するため、2つの機能があります（FLUX学習と共通）。
+
+* **学習ログ:** 学習開始時に、タイムステップサンプリング設定の概要を1行ログ出力します。選択した`--timestep_sampling`に対して`--discrete_flow_shift`が適用されるか（使用するのは`sigma`と`shift`のみ。`sigmoid`、`uniform`、`flux_shift`では**無視**される）を明示するため、設定したシフト値が効いていない場合に気づきやすくなります。
+* `--show_timesteps=<console|image>`: 現在の設定で実際にサンプリングされるタイムステップ分布とloss weightingを可視化して終了します（学習は行いません）。`console`はASCIIヒストグラム、`image`はmatplotlibで表示します（`matplotlib`が必要）。分布はノイズ側（上／左、t=1000）からクリーン側（下／右、t=0）の順で表示されます。
+* `--show_timesteps_resolution=<H | H,W>`: `flux_shift`等の解像度依存サンプリングで`--show_timesteps`が想定する画像解像度（ピクセル）。数値が1つなら縦横両方に、カンマ区切りで2つなら`H,W`に使用します（`W,H`でも結果は同じ）。デフォルト`1024`。`.toml`データセット設定を使用すると`--resolution`が`None`になるため、この指定が役立ちます。
 
 #### キャプションドロップアウト
 

@@ -892,7 +892,7 @@ class TLoRANetwork(torch.nn.Module):
 
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
-            from library import train_util
+            import library.model_io as model_io
 
             if metadata is None:
                 metadata = {}
@@ -902,7 +902,7 @@ class TLoRANetwork(torch.nn.Module):
             metadata["ss_tlora_init"] = self.tlora_init
             metadata["ss_tlora_sig_type"] = self.tlora_sig_type
 
-            model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata)
+            model_hash, legacy_hash = model_io.precalculate_safetensors_hashes(state_dict, metadata)
             metadata["sshs_model_hash"] = model_hash
             metadata["sshs_legacy_hash"] = legacy_hash
             save_file(state_dict, file, metadata)
@@ -917,7 +917,7 @@ class TLoRANetwork(torch.nn.Module):
                 comfy_sd = convert_tlora_state_dict_to_comfy(state_dict, target_dtype=dtype)
                 comfy_metadata = clean_comfy_metadata(metadata)
                 # Recompute hashes for the converted state dict
-                model_hash_c, legacy_hash_c = train_util.precalculate_safetensors_hashes(
+                model_hash_c, legacy_hash_c = model_io.precalculate_safetensors_hashes(
                     comfy_sd, comfy_metadata
                 )
                 comfy_metadata["sshs_model_hash"] = model_hash_c

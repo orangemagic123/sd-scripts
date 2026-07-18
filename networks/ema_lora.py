@@ -67,7 +67,7 @@ NON_EMA_KEY_SUBSTRINGS = (".alpha",)
 
 
 # sd-scripts writes intermediate checkpoints using these patterns (see
-# library/train_util.py):
+# library/checkpoint_io.py):
 #   EPOCH_FILE_NAME: "{output_name}-{epoch:06d}"      -> '...-000042'
 #   STEP_FILE_NAME:  "{output_name}-step{step:08d}"   -> '...-step00001000'
 # We only treat a trailing group that matches these exact shapes as the epoch
