@@ -24,16 +24,17 @@ from voluptuous import (
 )
 from transformers import CLIPTokenizer
 
-from . import train_util
-from .train_util import (
+from . import accelerator_setup
+from . import args as args_util
+from .subset import (
     DreamBoothSubset,
     FineTuningSubset,
     ControlNetSubset,
-    DreamBoothDataset,
-    FineTuningDataset,
-    ControlNetDataset,
-    DatasetGroup,
 )
+from .dataset import DatasetGroup
+from .dreambooth_dataset import DreamBoothDataset
+from .finetuning_dataset import FineTuningDataset
+from .controlnet_dataset import ControlNetDataset
 from .utils import setup_logging
 
 setup_logging()
@@ -108,6 +109,7 @@ class ControlNetSubsetParams(BaseSubsetParams):
 class BaseDatasetParams:
     resolution: Optional[Tuple[int, int]] = None
     network_multiplier: float = 1.0
+    train_inpainting: bool = False
     debug_dataset: bool = False
     validation_seed: Optional[int] = None
     validation_split: float = 0.0
@@ -259,6 +261,7 @@ class ConfigSanitizer:
     # options handled by argparse but not handled by user config
     ARGPARSE_SPECIFIC_SCHEMA = {
         "debug_dataset": bool,
+        "train_inpainting": bool,
         "max_token_length": Any(None, int),
         "prior_loss_weight": Any(float, int),
     }
@@ -724,12 +727,12 @@ if __name__ == "__main__":
     config_args, remain = parser.parse_known_args()
 
     parser = argparse.ArgumentParser()
-    train_util.add_dataset_arguments(
+    args_util.add_dataset_arguments(
         parser, config_args.support_dreambooth, config_args.support_finetuning, config_args.support_dropout
     )
-    train_util.add_training_arguments(parser, config_args.support_dreambooth)
+    args_util.add_training_arguments(parser, config_args.support_dreambooth)
     argparse_namespace = parser.parse_args(remain)
-    train_util.prepare_dataset_args(argparse_namespace, config_args.support_finetuning)
+    accelerator_setup.prepare_dataset_args(argparse_namespace, config_args.support_finetuning)
 
     logger.info("[argparse_namespace]")
     logger.info(f"{vars(argparse_namespace)}")

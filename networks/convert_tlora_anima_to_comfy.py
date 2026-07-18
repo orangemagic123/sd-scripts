@@ -252,9 +252,9 @@ def main(args):
     metadata = clean_comfy_metadata(metadata)
 
     try:
-        from library import train_util
+        import library.model_io as model_io
         logger.info("Calculating hashes and creating metadata...")
-        model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(out_sd, metadata)
+        model_hash, legacy_hash = model_io.precalculate_safetensors_hashes(out_sd, metadata)
         metadata["sshs_model_hash"] = model_hash
         metadata["sshs_legacy_hash"] = legacy_hash
     except Exception as e:

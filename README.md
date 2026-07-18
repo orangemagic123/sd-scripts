@@ -47,45 +47,48 @@ If you find this project helpful, please consider supporting its development via
 
 ### Change History
 
-- **Unreleased / dev:**
-    - **Network weight EMA** is now available for additional-network training via the new `--ema_decay` option. The EMA copy is used for checkpoint saving, validation and sample image generation, persisted with `--save_state` / `--resume`, and recorded as `ss_ema_decay` in the model metadata. See [Advanced Training §1.17](./docs/train_network_advanced.md#117-network-weight-ema--ネットワーク重みのema) for details.
-    - **Post-hoc EMA over LoRA checkpoints** is provided as a standalone utility `networks/ema_lora.py`. It can EMA-average a folder of per-epoch LoRA checkpoints without re-running training, supports `--start_epoch` to skip early unstable checkpoints, and preserves the source dtype on save (so an `fp16` input produces an `fp16` output). See [Advanced Training §1.20](./docs/train_network_advanced.md#120-post-hoc-ema-over-saved-lora-checkpoints--学習後のlora-emaスクリプト).
-    - **Mixed caption mode** (`--caption_mode=mixed`) lets each image carry both a tag-style caption and a separate natural-language caption (with the suffix `_nl`), and randomly samples one of `tags`, `nl`, `tags_nl`, `nl_tags` per step. Per-subset weights can be set via the new `mixed_weights` TOML key. See [Advanced Training §1.18](./docs/train_network_advanced.md#118-mixed-caption-mode-and-protected-tags--混合キャプションモードと保護タグ) and the [Dataset configuration guide](./docs/config_README-en.md).
-    - **Protected tags** can now be specified via `--protected_tags_file` or the per-subset `protected_tags_file` TOML key. Tags listed in this file are exempt from `caption_tag_dropout_rate` (they are still shuffled).
-    - **Caption debug logging**: the new `--log_captions_every_n_steps` and `--log_captions_max_length` options print the actual caption (and the dropped tags / selected mixed mode) used by the dataloader at exactly the requested global step, even with `num_workers > 0`. The log is also produced when `--cache_text_encoder_outputs` is enabled. See [Advanced Training §1.19](./docs/train_network_advanced.md#119-caption-debug-logging--キャプションデバッグログ).
-    - **Variant-pool caching for text encoder outputs** (Anima): the new `--cache_text_encoder_outputs_num_variants K` option pre-caches `K` text-encoder output variants per image, so `shuffle_caption`, `caption_tag_dropout_rate` and `caption_mode = "mixed"` can now be used together with `--cache_text_encoder_outputs`. See [Anima training §7.2](./docs/anima_train_network.md#72-training-settings--学習設定) and [Advanced Training §1.21](./docs/train_network_advanced.md#121-variant-pool-caching-for-text-encoder-outputs--テキストエンコーダ出力のバリアントキャッシュ).
-    - **T-LoRA (Timestep-dependent LoRA, AAAI 2026)** is now supported for SD/SDXL (`networks/lora_tlora.py`) and for Anima (`networks/lora_tlora_anima.py`). T-LoRA dynamically lowers the effective rank for noisy timesteps to prevent overfitting in few-shot fine-tuning, and supports both `kaiming` and (`layer_`)`orthogonal` initialization with `principal` / `last` / `middle` singular value selection. The Anima variant supports Flow-Matching timesteps. See [Anima training §9](./docs/anima_train_network.md#9-related-tools--関連ツール) for usage.
-    - **T-LoRA → ComfyUI converter** (`networks/convert_tlora_anima_to_comfy.py`): losslessly fuses an orthogonal T-LoRA Anima checkpoint into a standard rank-`2r` LoRA in ComfyUI naming. The converter is also invoked automatically by `lora_tlora_anima.py` when saving checkpoints, producing a sibling `*_comfy.safetensors` file alongside each save.
-    - **`bucket_no_upscale` correctness fix**: when this option is enabled, `min_bucket_reso` / `max_bucket_reso` are now respected for images larger than the training resolution. Only images smaller than the training resolution still get their own arbitrary "no-upscale" bucket.
-    - **Flash attention + bf16 mixed precision** dtype-mismatch crash has been fixed; flash attention can now be used together with `bf16` and LoRA / LoKr without `RuntimeError`.
-    - **LoKr full-matrix mode** now emits a single summary warning instead of one warning per module, dramatically reducing log noise on large networks.
-    - **Verbose flag** is now honored for `AdditionalNetwork` module-creation logs — `--network_args verbose=False` no longer prints per-module creation messages.
+- **Unreleased / dev (fork additions):**
+    - **Network weight EMA** is available for additional-network training via `--ema_decay`. The EMA copy is used for checkpoint saving, validation and sample generation, persisted with `--save_state` / `--resume`, and recorded as `ss_ema_decay` in model metadata. See [Advanced Training §1.17](./docs/train_network_advanced.md#117-network-weight-ema--ネットワーク重みのema).
+    - **Post-hoc EMA over LoRA checkpoints** is provided by `networks/ema_lora.py`. It supports `--start_epoch`, preserves the source dtype, and can average a folder of saved checkpoints without retraining. See [Advanced Training §1.20](./docs/train_network_advanced.md#120-post-hoc-ema-over-saved-lora-checkpoints--学習後のlora-emaスクリプト).
+    - **Mixed caption mode** (`caption_mode = "mixed"`) lets each image use tag captions, `_nl` natural-language captions, or either concatenation order. Per-subset probabilities are controlled by `mixed_weights`. See [Advanced Training §1.18](./docs/train_network_advanced.md#118-mixed-caption-mode-and-protected-tags--混合キャプションモードと保護タグ).
+    - **Protected tags** can be specified with `--protected_tags_file` or a per-subset `protected_tags_file`; protected tags are exempt from normal tag dropout while still participating in shuffling.
+    - **Special fixed-token dropout** is controlled independently with `special_caption_tag_dropout_rate`.
+    - **Caption debug logging** is available through `--log_captions_every_n_steps` and `--log_captions_max_length`, including mixed-mode selection and dropped-tag details. See [Advanced Training §1.19](./docs/train_network_advanced.md#119-caption-debug-logging--キャプションデバッグログ).
+    - **Variant-pool text-encoder caching** for Anima uses `--cache_text_encoder_outputs_num_variants K` to retain caption diversity while text-encoder outputs are cached. See [Advanced Training §1.21](./docs/train_network_advanced.md#121-variant-pool-caching-for-text-encoder-outputs--テキストエンコーダ出力のバリアントキャッシュ).
+    - **T-LoRA (Timestep-dependent LoRA, AAAI 2026)** is supported for SD/SDXL and Anima, including orthogonal initialization and a lossless Anima-to-ComfyUI converter.
+    - **`bucket_no_upscale` correctness fix:** min/max bucket resolutions remain effective for images at or above the training area; only smaller images receive arbitrary no-upscale buckets.
+    - **bf16 flash-attention stability**, summarized LoKr full-matrix warnings, and correct `AdditionalNetwork` verbose logging are retained.
 
-- **Version 0.10.3 (2026-04-02):**
-    - Stability when training with fp16 on Anima has been further improved. See [PR #2302](https://github.com/kohya-ss/sd-scripts/pull/2302) for details. We deeply appreciate those who reported the issue.
+- **Version 0.11.1 (2026-06-16):**
+    - Added support for torch.compile in Anima LoRA/LLLite training. [PR #2379](https://github.com/kohya-ss/sd-scripts/pull/2379)
+        - It seems to speed up training by about 20%. It requires Triton and MSVC compiler. For details, please refer to the [documentation](./docs/anima_torch_compile.md).
+    - Added 2D-only Qwen-Image VAE. [PR #2382](https://github.com/kohya-ss/sd-scripts/pull/2382)
+        - Based on the suggestion by woct0rdho in [issue #2369](https://github.com/kohya-ss/sd-scripts/issues/2369). Thanks to woct0rdho.
+        - Enabled by specifying `--qwen_image_vae_2d`. The weights are the same as the standard (3D) version.
+        - Expected to speed up latent pre-caching (training itself remains unchanged). For details, please refer to the [documentation](./docs/anima_train_network.md#memory-and-speed--メモリ速度関連).
+    - Added support for LLLite inpainting model training. [PR #2378](https://github.com/kohya-ss/sd-scripts/pull/2378)
+        - For details, please refer to the [documentation](./docs/anima_train_control_net_lllite.md).
+    - Added logging of timestep sampling settings and visualization of timesteps distribution. [PR #2384](https://github.com/kohya-ss/sd-scripts/pull/2384)
+        - Visualization makes it easier to understand how training is conducted at different timesteps.
+        - For details, please refer to the [documentation](./docs/anima_train_network.md#visualizing-the-timestep-distribution).
 
-- **Version 0.10.2 (2026-03-30):**
-    - LECO training for SD/SDXL is now supported. Many thanks to umisetokikaze for [PR #2285](https://github.com/kohya-ss/sd-scripts/pull/2285) and [PR #2294](https://github.com/kohya-ss/sd-scripts/pull/2294).
-        - Please refer to the [documentation](./docs/train_leco.md) for details.
-    - `networks/resize_lora.py` has been updated to use `torch.svd_lowrank`, resulting in a significant speedup. Many thanks to woct0rdho for [PR #2240](https://github.com/kohya-ss/sd-scripts/pull/2240) and [PR #2296](https://github.com/kohya-ss/sd-scripts/pull/2296).
-        - It is enabled by default. You can specify the number of iterations with the `--svd_lowrank_niter` option (default is 2, more iterations will improve accuracy). Setting it to 0 will revert to the previous method. Please check `--help` for details.
-    - LoKr/LoHa is now supported for SDXL/Anima. See [PR #2275](https://github.com/kohya-ss/sd-scripts/pull/2275) for details.
-        - Please refer to the [documentation](./docs/loha_lokr.md) for details.
-    - Multi-resolution datasets (using the same image resized to multiple bucket sizes) are now supported in SD/SDXL training. We also addressed the issue of duplicate images with the same resolution being used in multi-resolution datasets. See [PR #2269](https://github.com/kohya-ss/sd-scripts/pull/2269) and [PR #2273](https://github.com/kohya-ss/sd-scripts/pull/2273) for details.
-        - Thanks to woct0rdho for the contribution.
-        - Please refer to the [English documentation](./docs/config_README-en.md#behavior-when-there-are-duplicate-subsets) / [Japanese documentation](./docs/config_README-ja.md#重複したサブセットが存在する時の挙動) for details.
-    - Stability when training with fp16 on Anima has been improved. See [PR #2297](https://github.com/kohya-ss/sd-scripts/pull/2297) for details. However, it still seems to be unstable in some cases. If you encounter any issues, please let us know the details via Issues.
-    - Other minor bug fixes and improvements were made.
+- **Version 0.11.0 (2026-06-12):**
+    - A major internal refactoring of the codebase has been performed to improve code quality and maintainability. [PR #2372](https://github.com/kohya-ss/sd-scripts/pull/2372)
+        - We have made efforts to minimize direct impact on users. For details and bug reports, please refer to [this discussion](https://github.com/kohya-ss/sd-scripts/discussions/2358).
 
-- **Version 0.10.1 (2026-02-13):**
-    - [Anima Preview](https://huggingface.co/circlestone-labs/Anima) model LoRA training and fine-tuning are now supported. See [PR #2260](https://github.com/kohya-ss/sd-scripts/pull/2260) and [PR #2261](https://github.com/kohya-ss/sd-scripts/pull/2261).
-    - Many thanks to CircleStone Labs for releasing this amazing model, and to duongve13112002 for submitting great PR #2260.
-    - For details, please refer to the [documentation](./docs/anima_train_network.md).
+- **Version 0.10.6 (2026-06-12):**
+    - Stable version before refactoring merge.
 
-- **Version 0.10.0 (2026-01-19):**
-    - `sd3` branch is merged to `main` branch. From this version, FLUX.1 and SD3/SD3.5 etc. are supported in the `main` branch.
-    - There are still some missing parts in the documentation, so please let us know if you find any issues via Issues etc.
-    - The `sd3` branch will be maintained as a development branch synchronized with `dev` for the time being.
+- **Version 0.10.5 (2026-05-08):**
+    - Support for transformers version 5 and later has been added. Thanks to marcus165090-spec for [PR #2315](https://github.com/kohya-ss/sd-scripts/pull/2315) (followed by [PR #2316](https://github.com/kohya-ss/sd-scripts/pull/2316)).
+        - The `transformers` version in `requirements.txt` remains 4.x, but it also works with 5.x. If you use 5.x for any reason, please also update `diffusers` to the latest version.
+    - Support for ControlNet-LLLite training for Anima has been added. Thanks to [PR #2317](https://github.com/kohya-ss/sd-scripts/pull/2317).
+        - For details, please refer to the [documentation](./docs/anima_train_control_net_lllite.md).
+
+- **Version 0.10.4 (2026-05-07):**
+    - Improved compatibility with Intel GPUs. Thanks to WhitePr for [PR #2307](https://github.com/kohya-ss/sd-scripts/pull/2307).
+    - Support for training inpainting models for SD 1.5/SDXL has been added. Thanks to allanoepping for [PR #2309](https://github.com/kohya-ss/sd-scripts/pull/2309) (followed by [PR #2318](https://github.com/kohya-ss/sd-scripts/pull/2318)).
+        - For details, please refer to the [documentation](./docs/inpainting_training.md).
 
 ### Supported Models
 
@@ -95,12 +98,14 @@ If you find this project helpful, please consider supporting its development via
 * **FLUX.1**
 * **LUMINA**
 * **HunyuanImage-2.1**
+* **Anima**
 
 ### Features
 
 * LoRA training
 * Fine-tuning (native training, DreamBooth): except for HunyuanImage-2.1
 * Textual Inversion training: SD/SDXL
+* Inpainting model training: SD1.5 and SDXL
 * Image generation
 * Other utilities such as model conversion, image tagging, LoRA merging, etc.
 
@@ -119,8 +124,10 @@ If you find this project helpful, please consider supporting its development via
 * [Fine-tuning](./docs/fine_tune.md)
 * [Textual Inversion Training](./docs/train_textual_inversion.md)
 * [ControlNet-LLLite Training](./docs/train_lllite_README.md) / [Japanese version](./docs/train_lllite_README-ja.md)
+* [Anima ControlNet-LLLite Training Guide](./docs/anima_train_control_net_lllite.md)
 * [Validation](./docs/validation.md)
 * [Masked Loss Training](./docs/masked_loss_README.md) / [Japanese version](./docs/masked_loss_README-ja.md)
+* [Inpainting Training](./docs/inpainting_training.md)
 
 ### Other Documentation (English and Japanese)
 
