@@ -19,7 +19,7 @@ from library.strategy_krea2 import (
     Krea2TextEncodingStrategy,
     Krea2TokenizeStrategy,
 )
-from networks import lora_krea2
+from networks import lora_krea2, lycoris_krea2
 
 
 def _make_text_tokens(sequence_length: int, *, layers: int = 2, dim: int = 4, dtype=torch.float32):
@@ -246,6 +246,111 @@ def test_krea2_lora_wraps_every_linear_but_no_raw_norm_or_modulation_parameter()
     assert not {
         "lora_unet_" + name.replace(".", "_") for name in raw_parameter_names
     } & actual_lora_names
+
+
+@pytest.mark.parametrize(
+    ("algo", "module_class_name"),
+    [
+        ("lora", "LoConModule"),
+        ("loha", "LohaModule"),
+        ("lokr", "LokrModule"),
+    ],
+)
+def test_krea2_lycoris_wraps_every_linear_with_checkpoint_compatible_names(algo, module_class_name):
+    config = _tiny_config()
+    model = SingleStreamDiT(config, attn_mode="torch")
+    linear_names = {name for name, module in model.named_modules() if isinstance(module, nn.Linear)}
+
+    # The cached Qwen3-VL object can already be on meta here; the Krea 2
+    # wrapper must not traverse or adapt it.
+    network = lycoris_krea2.create_network(1.0, 4, 4, None, [object()], model, algo=algo)
+    expected_names = {"lora_unet_" + name.replace(".", "_") for name in linear_names}
+    actual_names = {module.lora_name for module in network.unet_loras}
+
+    assert actual_names == expected_names
+    assert not network.text_encoder_loras
+    assert {type(module).__name__ for module in network.unet_loras} == {module_class_name}
+    assert not any(name.startswith("lora_unet__") for name in actual_names)
+
+
+@pytest.mark.parametrize("algo", ["lora", "loha", "lokr"])
+def test_krea2_lycoris_forward_backward_and_weight_restore(algo):
+    torch.manual_seed(0)
+    config = _tiny_config()
+    model = SingleStreamDiT(config, attn_mode="torch").train()
+    network = lycoris_krea2.create_network(1.0, 2, 2, None, [], model, algo=algo)
+    network.apply_to([], model, apply_text_encoder=False, apply_unet=True)
+
+    image_tokens = torch.randn(1, 4, config.channels * config.patch**2)
+    text_tokens = torch.randn(1, 3, config.txtlayers, config.txtdim)
+    positions = torch.zeros(1, 7, 3)
+    mask = torch.tensor([[True, True, True, True, True, True, False]])
+    output = model(image_tokens, text_tokens, torch.tensor([0.5]), positions, mask)
+    output.square().mean().backward()
+
+    adapter_grads = [parameter.grad for parameter in network.parameters() if parameter.requires_grad]
+    assert adapter_grads
+    assert any(grad is not None and torch.isfinite(grad).all() for grad in adapter_grads)
+
+    weights_sd = {key: value.detach().clone() for key, value in network.state_dict().items()}
+    restored_model = SingleStreamDiT(config, attn_mode="torch")
+    restored, returned_weights = lycoris_krea2.create_network_from_weights(
+        1.0,
+        None,
+        None,
+        [],
+        restored_model,
+        weights_sd=weights_sd,
+    )
+
+    expected_names = {module.lora_name for module in network.unet_loras}
+    assert {module.lora_name for module in restored.unet_loras} == expected_names
+    assert returned_weights is weights_sd
+
+
+@pytest.mark.parametrize("algo", ["lora", "loha", "lokr"])
+def test_krea2_checkpoint_loader_merges_lycoris_weights(tmp_path, algo):
+    torch.manual_seed(0)
+    config = _tiny_config()
+    base_model = SingleStreamDiT(config, attn_mode="torch")
+    base_state = {key: value.detach().contiguous().clone() for key, value in base_model.state_dict().items()}
+    checkpoint = tmp_path / f"tiny_krea2_{algo}.safetensors"
+    save_file(base_state, checkpoint)
+
+    network = lycoris_krea2.create_network(1.0, 2, 2, None, [], base_model, algo=algo)
+    network.apply_to([], base_model, apply_text_encoder=False, apply_unet=True)
+    with torch.no_grad():
+        for parameter in network.parameters():
+            if parameter.is_floating_point():
+                parameter.normal_(mean=0.0, std=0.05)
+    weights_sd = {key: value.detach().contiguous().clone() for key, value in network.state_dict().items()}
+
+    loaded = load_krea2_dit(
+        str(checkpoint),
+        device="cpu",
+        dtype=torch.float32,
+        config=config,
+        lora_weights=[weights_sd],
+        lora_multipliers=[1.0],
+        disable_mmap=True,
+    )
+
+    linear_weight_keys = [f"{name}.weight" for name, module in loaded.named_modules() if isinstance(module, nn.Linear)]
+    assert any(not torch.equal(loaded.state_dict()[key], base_state[key]) for key in linear_weight_keys)
+    assert torch.equal(loaded.state_dict()["blocks.0.prenorm.scale"], base_state["blocks.0.prenorm.scale"])
+
+
+def test_krea2_resolves_the_public_lycoris_module_name_to_its_architecture_adapter():
+    from krea2_train_network import Krea2NetworkTrainer, resolve_krea2_network_module
+
+    assert resolve_krea2_network_module(None) == "networks.lora_krea2"
+    assert resolve_krea2_network_module("networks.lora_krea2") == "networks.lora_krea2"
+    assert resolve_krea2_network_module("lycoris.kohya") == "lycoris.kohya"
+    assert resolve_krea2_network_module("networks.lycoris_krea2") == "networks.lycoris_krea2"
+    trainer = Krea2NetworkTrainer()
+    assert trainer.get_network_module_name(SimpleNamespace(network_module="lycoris.kohya")) == "networks.lycoris_krea2"
+    with pytest.raises(ValueError, match="lycoris.kohya"):
+        resolve_krea2_network_module("networks.lora")
 
 
 def test_qwen3vl_comfyui_and_hf_state_dict_key_conversion():
