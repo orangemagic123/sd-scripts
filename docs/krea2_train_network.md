@@ -58,10 +58,23 @@ Separate Krea 2 cache scripts are not used in sd-scripts. `krea2_train_network.p
 - `--cache_latents`: encode images with the Qwen-Image VAE before training.
 - `--cache_text_encoder_outputs`: encode captions with Qwen3-VL before training.
 - `--cache_text_encoder_outputs_to_disk`: store the text cache on disk instead of keeping the complete cache in memory.
+- `--cache_text_encoder_outputs_num_variants=K`: pre-generate `K` processed-caption embeddings per image and select one with `epoch % K` during training.
 
-The text cache contains the selected Qwen3-VL hidden-state layers for valid, non-padding tokens. The trainable text-fusion layers remain inside the DiT; the Qwen3-VL model itself is not trained. Deterministic dataset processing such as caption prefix/suffix, separators, and fixed replacements is applied before encoding. Stochastic or epoch-dependent caption processing (wildcards, dropout, shuffling, token warmup, mixed captions, and random replacement choices) is rejected because one fixed embedding cannot represent it.
+The text cache contains the selected Qwen3-VL hidden-state layers for valid, non-padding tokens. The trainable text-fusion layers remain inside the DiT; the Qwen3-VL model itself is not trained. Deterministic dataset processing such as caption prefix/suffix, separators, and fixed replacements is applied before encoding.
 
-Disk caches record the processed-caption hash and the encoder, tokenizer, and maximum-length configuration. A changed caption or text-encoder configuration therefore rebuilds the affected cache unless `--skip_cache_check` is explicitly used.
+With the default `K = 0`, one fixed embedding is stored per image. This mode rejects stochastic or epoch-dependent caption processing because one embedding cannot represent it. When `K > 0`, Krea 2 instead creates `<image>_krea2_te_v0.npz` through `<image>_krea2_te_vK-1.npz`. Each file independently applies caption shuffling, normal and special tag dropout, mixed-caption selection, wildcards, and random replacement choices. Disk caching is enabled automatically because all variants must remain available for epoch-based selection.
+
+Step-dependent `token_warmup_step` and `caption_dropout_every_n_epochs` still cannot be represented by a fixed variant pool. Full-caption `caption_dropout_rate` is also unsupported for Krea 2 variants; use tag dropout, shuffling, or mixed captions instead. A typical TOML setup is:
+
+```toml
+cache_text_encoder_outputs = true
+cache_text_encoder_outputs_to_disk = true
+cache_text_encoder_outputs_num_variants = 10
+```
+
+Krea 2 text caches are large: one variant uses approximately `valid_tokens * 12 * 2560 * 2` bytes before small NPZ metadata overhead. At 256 valid tokens this is about 15 MiB per image per variant, so choose `K` according to available disk space.
+
+Disk caches record the processed-caption hash and the encoder, tokenizer, and maximum-length configuration. A changed caption or text-encoder configuration therefore rebuilds a single cache unless `--skip_cache_check` is explicitly used. Variant captions are random by design, so existing variant files are validated structurally rather than regenerated on every launch; delete the `_krea2_te_v*.npz` files after changing source captions or variant-generation settings.
 
 ## Basic training example
 

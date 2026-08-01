@@ -84,6 +84,27 @@ class Krea2NetworkTrainer(train_network.NetworkTrainer):
             if any(isinstance(value, list) for value in getattr(dataset, "replacements", {}).values()):
                 raise ValueError(f"Krea 2 {label} text caching does not support random caption replacements")
 
+    @staticmethod
+    def _assert_variant_text_cache(dataset_group, label: str):
+        datasets = getattr(dataset_group, "datasets", [dataset_group])
+        for dataset in datasets:
+            for subset in getattr(dataset, "subsets", []):
+                if getattr(subset, "token_warmup_step", 0) > 0:
+                    raise ValueError(
+                        f"Krea 2 {label} caption variants do not support token_warmup_step "
+                        "because it depends on the training step"
+                    )
+                if getattr(subset, "caption_dropout_rate", 0.0) > 0:
+                    raise ValueError(
+                        f"Krea 2 {label} caption variants do not support caption_dropout_rate; "
+                        "use tag dropout, caption shuffling, or mixed captions instead"
+                    )
+                if getattr(subset, "caption_dropout_every_n_epochs", 0) > 0:
+                    raise ValueError(
+                        f"Krea 2 {label} caption variants do not support "
+                        "caption_dropout_every_n_epochs"
+                    )
+
     def assert_extra_args(
         self,
         args,
@@ -107,22 +128,36 @@ class Krea2NetworkTrainer(train_network.NetworkTrainer):
             raise ValueError("Krea 2 does not support training Qwen3-VL")
         args.network_train_unet_only = True
 
-        if args.cache_text_encoder_outputs_num_variants:
-            raise ValueError("Krea 2 text caches do not support caption variants")
         if not args.cache_text_encoder_outputs:
             logger.warning("Krea 2 requires cached Qwen3-VL outputs; enabling --cache_text_encoder_outputs")
             args.cache_text_encoder_outputs = True
         if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
             args.cache_text_encoder_outputs = True
-        if not train_dataset_group.is_text_encoder_output_cacheable():
-            raise ValueError(
-                "Krea 2 text caching cannot be combined with stochastic or step-dependent caption processing"
-            )
-        self._assert_deterministic_text_cache(train_dataset_group, "training")
-        if val_dataset_group is not None and not val_dataset_group.is_text_encoder_output_cacheable():
-            raise ValueError("The Krea 2 validation dataset must also be text-encoder-output cacheable")
-        if val_dataset_group is not None:
-            self._assert_deterministic_text_cache(val_dataset_group, "validation")
+
+        num_variants = getattr(args, "cache_text_encoder_outputs_num_variants", 0) or 0
+        if num_variants < 0:
+            raise ValueError("--cache_text_encoder_outputs_num_variants must be zero or greater")
+        if num_variants > 0:
+            if not args.cache_text_encoder_outputs_to_disk:
+                logger.warning(
+                    "Krea 2 caption variants require disk caching; enabling "
+                    "--cache_text_encoder_outputs_to_disk"
+                )
+                args.cache_text_encoder_outputs_to_disk = True
+            self._assert_variant_text_cache(train_dataset_group, "training")
+            if val_dataset_group is not None:
+                self._assert_variant_text_cache(val_dataset_group, "validation")
+        else:
+            if not train_dataset_group.is_text_encoder_output_cacheable():
+                raise ValueError(
+                    "Krea 2 text caching cannot be combined with stochastic or step-dependent "
+                    "caption processing unless --cache_text_encoder_outputs_num_variants is set"
+                )
+            self._assert_deterministic_text_cache(train_dataset_group, "training")
+            if val_dataset_group is not None and not val_dataset_group.is_text_encoder_output_cacheable():
+                raise ValueError("The Krea 2 validation dataset must also be text-encoder-output cacheable")
+            if val_dataset_group is not None:
+                self._assert_deterministic_text_cache(val_dataset_group, "validation")
         if args.weighted_captions:
             raise ValueError("Krea 2 does not support --weighted_captions")
 
@@ -239,6 +274,7 @@ class Krea2NetworkTrainer(train_network.NetworkTrainer):
             text_encoder_max_length=args.text_encoder_max_length,
             tokenizer_path=args.tokenizer_path,
             text_encoder_path=args.text_encoder,
+            num_variants=getattr(args, "cache_text_encoder_outputs_num_variants", 0) or 0,
         )
 
     def get_models_for_text_encoding(self, args, accelerator, text_encoders):
@@ -258,7 +294,11 @@ class Krea2NetworkTrainer(train_network.NetworkTrainer):
         encoder = text_encoders[0]
         logger.info("Moving Qwen3-VL to the accelerator for the Krea 2 text-cache pass")
         encoder.to(accelerator.device)
-        dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
+        num_variants = getattr(args, "cache_text_encoder_outputs_num_variants", 0) or 0
+        if num_variants > 0:
+            dataset.new_cache_text_encoder_outputs_variants(num_variants, text_encoders, accelerator)
+        else:
+            dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
 
         if args.sample_prompts is not None and self.sample_prompts_te_outputs is None:
             logger.info(f"Caching Krea 2 sample-prompt embeddings: {args.sample_prompts}")

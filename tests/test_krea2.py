@@ -465,6 +465,136 @@ def test_krea2_cache_pass_encodes_the_processed_caption():
     assert info.text_encoder_outputs[0].dtype == torch.bfloat16
 
 
+def test_krea2_text_cache_builds_independent_caption_variant_files(tmp_path):
+    strategy = Krea2TextEncoderOutputsCachingStrategy(True, 1, False, num_variants=2)
+    captured_captions = []
+
+    class Encoder:
+        def __call__(self, captions):
+            captured_captions.append(list(captions))
+            value = len(captured_captions)
+            hidden = torch.full((len(captions), 2, 12, 2560), value, dtype=torch.bfloat16)
+            return hidden, torch.ones(len(captions), 2, dtype=torch.bool)
+
+    image_path = tmp_path / "sample.png"
+    info = SimpleNamespace(
+        image_key="image",
+        absolute_path=str(image_path),
+        caption="original",
+        caption_nl=None,
+        text_encoder_outputs=None,
+        text_encoder_outputs_npz=None,
+    )
+    dataset = object.__new__(BaseDataset)
+    dataset.batch_size = 1
+    dataset.image_data = {info.image_key: info}
+    dataset.image_to_subset = {info.image_key: SimpleNamespace()}
+
+    accelerator = SimpleNamespace(num_processes=1, process_index=0)
+    with (
+        patch.object(TextEncoderOutputsCachingStrategy, "_strategy", strategy),
+        patch.object(TokenizeStrategy, "_strategy", Krea2TokenizeStrategy()),
+        patch.object(TextEncodingStrategy, "_strategy", Krea2TextEncodingStrategy()),
+        patch.object(
+            dataset,
+            "process_caption",
+            side_effect=[("first variant", {}), ("second variant", {})],
+        ),
+    ):
+        dataset.new_cache_text_encoder_outputs_variants(2, [Encoder()], accelerator)
+
+    first_path = strategy.get_variant_outputs_npz_path(str(image_path), 0)
+    second_path = strategy.get_variant_outputs_npz_path(str(image_path), 1)
+    assert strategy.num_variants == 2
+    assert captured_captions == [["first variant"], ["second variant"]]
+    assert strategy.is_disk_cached_outputs_expected_for_caption(first_path, "first variant")
+    assert strategy.is_disk_cached_outputs_expected_for_caption(second_path, "second variant")
+    assert torch.all(strategy.load_outputs_npz(first_path)[0] == 1)
+    assert torch.all(strategy.load_outputs_npz(second_path)[0] == 2)
+
+
+def test_krea2_trainer_enables_disk_cache_for_stochastic_caption_variants():
+    from krea2_train_network import Krea2NetworkTrainer
+
+    subset = SimpleNamespace(
+        token_warmup_step=0,
+        caption_dropout_rate=0.0,
+        caption_dropout_every_n_epochs=0,
+        shuffle_caption=True,
+        caption_tag_dropout_rate=0.1,
+        special_caption_tag_dropout_rate=0.1,
+        caption_mode="mixed",
+        enable_wildcard=True,
+    )
+
+    class DatasetGroup:
+        datasets = [SimpleNamespace(subsets=[subset], replacements={"color": ["red", "blue"]})]
+
+        @staticmethod
+        def is_text_encoder_output_cacheable():
+            return False
+
+        @staticmethod
+        def verify_bucket_reso_steps(_steps):
+            pass
+
+    args = SimpleNamespace(
+        pretrained_model_name_or_path="dit.safetensors",
+        vae="vae.safetensors",
+        text_encoder="text_encoder.safetensors",
+        mixed_precision="bf16",
+        network_module="networks.lora_krea2",
+        network_train_text_encoder_only=False,
+        network_train_unet_only=False,
+        cache_text_encoder_outputs=False,
+        cache_text_encoder_outputs_to_disk=False,
+        cache_text_encoder_outputs_num_variants=10,
+        weighted_captions=False,
+        fp8_base=False,
+        fp8_base_unet=False,
+        fp8_scaled=False,
+        cpu_offload_checkpointing=False,
+        blocks_to_swap=None,
+        compile=False,
+        xformers=False,
+        sdpa=True,
+        attn_mode=None,
+        split_attn=False,
+    )
+
+    with patch("krea2_train_network.flux_train_utils.log_timestep_sampling_info"):
+        Krea2NetworkTrainer().assert_extra_args(args, DatasetGroup(), None)
+
+    assert args.cache_text_encoder_outputs
+    assert args.cache_text_encoder_outputs_to_disk
+    assert args.network_train_unet_only
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("token_warmup_step", 1, "token_warmup_step"),
+        ("caption_dropout_rate", 0.1, "caption_dropout_rate"),
+        ("caption_dropout_every_n_epochs", 2, "caption_dropout_every_n_epochs"),
+    ],
+)
+def test_krea2_caption_variants_reject_processing_that_the_pool_cannot_represent(
+    option, value, message
+):
+    from krea2_train_network import Krea2NetworkTrainer
+
+    subset = SimpleNamespace(
+        token_warmup_step=0,
+        caption_dropout_rate=0.0,
+        caption_dropout_every_n_epochs=0,
+    )
+    setattr(subset, option, value)
+    dataset_group = SimpleNamespace(datasets=[SimpleNamespace(subsets=[subset])])
+
+    with pytest.raises(ValueError, match=message):
+        Krea2NetworkTrainer._assert_variant_text_cache(dataset_group, "training")
+
+
 def test_tiny_krea2_checkpoint_loader_assigns_exact_weights(tmp_path):
     config = _tiny_config()
     original = SingleStreamDiT(config, attn_mode="torch")
