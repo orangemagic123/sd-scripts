@@ -60,8 +60,15 @@ class Krea2TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         text_encoder_max_length: int = 512,
         tokenizer_path: Optional[str] = None,
         text_encoder_path: Optional[str] = None,
+        num_variants: int = 0,
     ) -> None:
-        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial=False)
+        super().__init__(
+            cache_to_disk,
+            batch_size,
+            skip_disk_cache_validity_check,
+            is_partial=False,
+            num_variants=num_variants,
+        )
         self.cache_signature = self._build_cache_signature(
             text_encoder_max_length,
             tokenizer_path,
@@ -117,7 +124,7 @@ class Krea2TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return os.path.splitext(image_abs_path)[0] + self.KREA2_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
 
     def get_variant_outputs_npz_path(self, image_abs_path: str, variant_idx: int) -> str:
-        raise ValueError("Krea 2 text caches do not support caption variants")
+        return os.path.splitext(image_abs_path)[0] + f"_krea2_te_v{variant_idx}.npz"
 
     def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
         if not self.cache_to_disk or not os.path.exists(npz_path):
@@ -194,8 +201,8 @@ class Krea2TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         captions: Optional[List[str]] = None,
         variant_idx: Optional[int] = None,
     ):
-        if variant_idx is not None:
-            raise ValueError("Krea 2 text caches do not support caption variants")
+        if variant_idx is not None and not self.cache_to_disk:
+            raise ValueError("Krea 2 caption variants require disk caching")
         if not models or models[0] is None:
             raise ValueError("The Qwen3-VL text encoder is required to build Krea 2 caches")
         if captions is None:
@@ -218,9 +225,14 @@ class Krea2TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             embed = hidden_states[index, :valid_length].contiguous()
             mask = attention_mask[index, :valid_length].contiguous()
             if self.cache_to_disk:
+                npz_path = (
+                    self.get_variant_outputs_npz_path(info.absolute_path, variant_idx)
+                    if variant_idx is not None
+                    else info.text_encoder_outputs_npz
+                )
                 array, dtype_name = self._tensor_to_numpy(embed)
                 np.savez(
-                    info.text_encoder_outputs_npz,
+                    npz_path,
                     vl_embed=array,
                     vl_embed_dtype=np.asarray(dtype_name),
                     attention_mask=mask.cpu().numpy(),
