@@ -8,6 +8,7 @@ einops==0.7.0
 # pytorch-lightning==1.9.0
 bitsandbytes
 lion-pytorch==0.2.3
+lycoris-lora==3.4.0
 schedulefree==1.4
 pytorch-optimizer==3.10.0
 prodigy-plus-schedule-free==1.9.2

@@ -1,8 +1,8 @@
 Status: experimental
 
-# Krea 2 LoRA training with `krea2_train_network.py`
+# Krea 2 LoRA and LyCORIS training with `krea2_train_network.py`
 
-`krea2_train_network.py` trains LoRA adapters for Krea 2 (K2) with the sd-scripts dataset and training pipeline. Krea 2 support is experimental and currently covers text-to-image training only; image editing, control inputs, and video training are not supported.
+`krea2_train_network.py` trains LoRA and LyCORIS adapters for Krea 2 (K2) with the sd-scripts dataset and training pipeline. Krea 2 support is experimental and currently covers text-to-image training only; image editing, control inputs, and video training are not supported.
 
 The recommended workflow is:
 
@@ -99,12 +99,27 @@ The required Krea 2 settings in this example are:
 - RAW checkpoint through `--pretrained_model_name_or_path`.
 - Qwen-Image VAE and Qwen3-VL through `--vae` and `--text_encoder`.
 - Optional local Qwen3-VL tokenizer directory through `--tokenizer_path`; omit it to use the default Hugging Face model ID.
-- `--network_module=networks.lora_krea2`.
+- `--network_module=networks.lora_krea2` for the built-in LoRA, or `--network_module=lycoris.kohya` for LyCORIS.
 - bf16 mixed precision.
 - LoRA rank and alpha of 32 as the recommended starting point.
 - `--timestep_sampling=krea2_shift --weighting_scheme=none`.
 
 The default Krea 2 network targets all DiT `Linear` layers, including attention, MLP, projection, and text-fusion layers. Training settings are not yet considered final, so treat the command as a starting point and validate outputs for your dataset.
+
+### LyCORIS
+
+Install the pinned LyCORIS dependency through `requirements.txt`, then select its regular kohya module name. Krea 2 automatically routes it through an architecture adapter, so no custom LyCORIS preset is needed:
+
+```toml
+network_module = "lycoris.kohya"
+network_dim = 32
+network_alpha = 32
+network_args = ["algo=lokr", "factor=8"]
+```
+
+The Krea 2 preset targets the same 264 DiT `Linear` layers as `networks.lora_krea2` and keeps standard `lora_unet_*` weight names. LoRA/LoCon, LoHa, and LoKr are covered by the Krea 2 tests. Other LyCORIS algorithms should be treated as experimental. `train_norm=True` is rejected because Krea 2 uses a custom RMSNorm, and `algo=tlora` is rejected because timestep-mask integration is not implemented. Qwen3-VL remains frozen for every network type.
+
+If `network_args` contains a `preset=...` entry copied from another architecture, Krea 2 ignores it and uses its built-in target preset. Other algorithm-specific arguments, such as `factor`, `full_matrix`, `dora_wd`, dropout settings, and LoRA+ ratios, are passed through to LyCORIS.
 
 ## Timestep sampling and loss
 

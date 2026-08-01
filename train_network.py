@@ -292,6 +292,11 @@ class NetworkTrainer:
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         pass
 
+    def get_network_module_name(self, args) -> str:
+        """Return the import name for the selected additional network module."""
+
+        return args.network_module
+
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
         noise_scheduler = DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
@@ -1114,8 +1119,9 @@ class NetworkTrainer:
 
         # 差分追加学習のためにモデルを読み込む
         sys.path.append(os.path.dirname(__file__))
-        accelerator.print("import network module:", args.network_module)
-        network_module = importlib.import_module(args.network_module)
+        network_module_name = self.get_network_module_name(args)
+        accelerator.print("import network module:", network_module_name)
+        network_module = importlib.import_module(network_module_name)
 
         if args.base_weights is not None:
             # base_weights が指定されている場合は、指定された重みを読み込みマージする

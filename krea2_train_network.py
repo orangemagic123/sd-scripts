@@ -36,6 +36,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+KREA2_LORA_NETWORK_MODULE = "networks.lora_krea2"
+KREA2_LYCORIS_NETWORK_MODULE = "networks.lycoris_krea2"
+KREA2_LYCORIS_NETWORK_ALIAS = "lycoris.kohya"
+
+
+def resolve_krea2_network_module(network_module: Optional[str]) -> str:
+    """Validate and normalize the public Krea 2 network-module name."""
+
+    if network_module is None:
+        return KREA2_LORA_NETWORK_MODULE
+    if network_module == KREA2_LYCORIS_NETWORK_ALIAS:
+        return KREA2_LYCORIS_NETWORK_ALIAS
+    if network_module in (KREA2_LORA_NETWORK_MODULE, KREA2_LYCORIS_NETWORK_MODULE):
+        return network_module
+    raise ValueError(
+        "Krea 2 supports --network_module=networks.lora_krea2 or "
+        "--network_module=lycoris.kohya"
+    )
+
+
 class Krea2NetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -44,6 +64,11 @@ class Krea2NetworkTrainer(train_network.NetworkTrainer):
         self._using_fp8_scaled = False
         self._requested_fp8_base = False
         self._requested_fp8_base_unet = False
+
+    def get_network_module_name(self, args) -> str:
+        if args.network_module == KREA2_LYCORIS_NETWORK_ALIAS:
+            return KREA2_LYCORIS_NETWORK_MODULE
+        return super().get_network_module_name(args)
 
     @staticmethod
     def _assert_deterministic_text_cache(dataset_group, label: str):
@@ -74,10 +99,10 @@ class Krea2NetworkTrainer(train_network.NetworkTrainer):
         if args.mixed_precision != "bf16":
             raise ValueError("Krea 2 training requires --mixed_precision=bf16")
 
-        if args.network_module is None:
-            args.network_module = "networks.lora_krea2"
-        if args.network_module != "networks.lora_krea2":
-            raise ValueError("Krea 2 currently supports --network_module=networks.lora_krea2")
+        requested_network_module = args.network_module
+        args.network_module = resolve_krea2_network_module(requested_network_module)
+        if requested_network_module == KREA2_LYCORIS_NETWORK_ALIAS:
+            logger.info("Using the Krea 2 architecture adapter for network_module=lycoris.kohya")
         if args.network_train_text_encoder_only:
             raise ValueError("Krea 2 does not support training Qwen3-VL")
         args.network_train_unet_only = True
@@ -419,7 +444,7 @@ def setup_parser() -> argparse.ArgumentParser:
     args_util.add_dit_training_arguments(parser)
     krea2_train_utils.add_krea2_training_arguments(parser)
     parser.set_defaults(
-        network_module="networks.lora_krea2",
+        network_module=KREA2_LORA_NETWORK_MODULE,
         network_train_unet_only=True,
         weighting_scheme="none",
         model_prediction_type="raw",
