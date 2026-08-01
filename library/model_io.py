@@ -293,6 +293,7 @@ def get_sai_model_spec_dataclass(
     hunyuan_image: str = None,
     anima: str = None,
     optional_metadata: dict[str, str] | None = None,
+    krea2: str = None,
 ) -> sai_model_spec.ModelSpecMetadata:
     """
     Get ModelSpec metadata as a dataclass - preferred for new code.
@@ -325,6 +326,8 @@ def get_sai_model_spec_dataclass(
         model_config["hunyuan_image"] = hunyuan_image
     if anima is not None:
         model_config["anima"] = anima
+    if krea2 is not None:
+        model_config["krea2"] = krea2
     # Use the dataclass function directly
     return sai_model_spec.build_metadata_dataclass(
         state_dict,

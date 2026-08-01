@@ -471,11 +471,32 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
 
 
 def get_noisy_model_input_and_timesteps(
-    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype
+    args,
+    noise_scheduler,
+    latents: torch.Tensor,
+    noise: torch.Tensor,
+    device,
+    dtype,
+    *,
+    return_timesteps_float32: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bsz, h, w = latents.shape[0], latents.shape[-2], latents.shape[-1]
     assert bsz > 0, "Batch size not large enough"
     num_timesteps = noise_scheduler.config.num_train_timesteps
+
+    def timestep_bound(name: str, default: int) -> float:
+        value = getattr(args, name, None)
+        # Some callers and tests use dynamic namespace objects (for example
+        # MagicMock), where an unset attribute is not actually None.
+        return value if isinstance(value, (int, float)) else default
+
+    continuous_sigma_sampling = {
+        "uniform",
+        "sigmoid",
+        "shift",
+        "flux_shift",
+        "krea2_shift",
+    }
     if args.timestep_sampling == "uniform" or args.timestep_sampling == "sigmoid":
         # Simple random sigma-based noise sampling
         if args.timestep_sampling == "sigmoid":
@@ -484,21 +505,28 @@ def get_noisy_model_input_and_timesteps(
         else:
             sigmas = torch.rand((bsz,), device=device)
 
-        timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "shift":
         shift = args.discrete_flow_shift
         sigmas = torch.randn(bsz, device=device)
         sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
         sigmas = sigmas.sigmoid()
         sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
-        timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "flux_shift":
         sigmas = torch.randn(bsz, device=device)
         sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
         sigmas = sigmas.sigmoid()
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))  # we are pre-packed so must adjust for packed size
         sigmas = time_shift(mu, 1.0, sigmas)
-        timesteps = sigmas * num_timesteps
+    elif args.timestep_sampling == "krea2_shift":
+        # Krea 2 uses Qwen-Image latents (8x compression) and 2x2 DiT patches.
+        # The schedule is defined over the resulting image-token count and is
+        # calibrated from 256 px (256 tokens, mu=0.5) to 1280 px (6400 tokens,
+        # mu=1.15). Bucketing guarantees a common spatial size within a batch.
+        sigmas = torch.randn(bsz, device=device)
+        sigmas = (sigmas * args.sigmoid_scale).sigmoid()
+        image_token_count = (h // 2) * (w // 2)
+        mu = get_lin_function(x1=256, y1=0.5, x2=6400, y2=1.15)(image_token_count)
+        sigmas = time_shift(mu, 1.0, sigmas)
     else:
         # Sample a random timestep for each image
         # for weighting schemes where we sample timesteps non-uniformly
@@ -509,9 +537,23 @@ def get_noisy_model_input_and_timesteps(
             logit_std=args.logit_std,
             mode_scale=args.mode_scale,
         )
-        indices = (u * num_timesteps).long()
+        min_timestep = timestep_bound("min_timestep", 0)
+        max_timestep = timestep_bound("max_timestep", num_timesteps)
+        indices = (u * (max_timestep - min_timestep) + min_timestep).long()
+        indices = indices.clamp(0, num_timesteps - 1)
         timesteps = noise_scheduler.timesteps[indices].to(device=device)
         sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
+
+    if args.timestep_sampling in continuous_sigma_sampling:
+        # Match musubi's flow-training semantics: transform the base sample
+        # first, then map it into the requested training range. This also makes
+        # validation's min_timestep == max_timestep override deterministic.
+        min_timestep = timestep_bound("min_timestep", 0)
+        max_timestep = timestep_bound("max_timestep", num_timesteps)
+        t_min = min_timestep / num_timesteps
+        t_max = max_timestep / num_timesteps
+        sigmas = sigmas * (t_max - t_min) + t_min
+        timesteps = sigmas * num_timesteps
 
     # Broadcast sigmas to latent shape
     sigmas = sigmas.view(-1, 1, 1, 1) if latents.ndim == 4 else sigmas.view(-1, 1, 1, 1, 1)
@@ -528,12 +570,13 @@ def get_noisy_model_input_and_timesteps(
     else:
         noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
 
-    return noisy_model_input.to(dtype), timesteps.to(dtype), sigmas
+    returned_timesteps = timesteps.float() if return_timesteps_float32 else timesteps.to(dtype)
+    return noisy_model_input.to(dtype), returned_timesteps, sigmas
 
 
 # timestep_sampling values whose distribution actually depends on --discrete_flow_shift.
 # "shift" uses it explicitly; "sigma" uses it via the shifted scheduler.timesteps. The others
-# ("uniform", "sigmoid", "flux_shift") ignore discrete_flow_shift entirely. This is shared by both
+# ("uniform", "sigmoid", "flux_shift", "krea2_shift") ignore discrete_flow_shift entirely. This is shared by both
 # FLUX and Anima since Anima reuses get_noisy_model_input_and_timesteps below.
 _SHIFT_AWARE_TIMESTEP_SAMPLING = ("sigma", "shift")
 
@@ -553,7 +596,7 @@ def get_timestep_sampling_info(args) -> str:
             f"discrete_flow_shift={args.discrete_flow_shift} (IGNORED for timestep_sampling='{sampling}'; "
             "only 'sigma' and 'shift' use it)"
         )
-    if sampling in ("sigmoid", "shift", "flux_shift"):
+    if sampling in ("sigmoid", "shift", "flux_shift", "krea2_shift"):
         parts.append(f"sigmoid_scale={args.sigmoid_scale}")
     if sampling == "sigma":
         parts.append(f"weighting_scheme={args.weighting_scheme}")

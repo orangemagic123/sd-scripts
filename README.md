@@ -48,6 +48,7 @@ If you find this project helpful, please consider supporting its development via
 ### Change History
 
 - **Unreleased / dev (fork additions):**
+    - **Experimental Krea 2 RAW LoRA training** is available through `krea2_train_network.py`, including Qwen3-VL output caching, Qwen-Image VAE latents, resolution-aware flow shifting, grouped-query attention, block swapping, and scaled fp8. See the [Krea 2 training guide](./docs/krea2_train_network.md).
     - **Network weight EMA** is available for additional-network training via `--ema_decay`. The EMA copy is used for checkpoint saving, validation and sample generation, persisted with `--save_state` / `--resume`, and recorded as `ss_ema_decay` in model metadata. See [Advanced Training §1.17](./docs/train_network_advanced.md#117-network-weight-ema--ネットワーク重みのema).
     - **Post-hoc EMA over LoRA checkpoints** is provided by `networks/ema_lora.py`. It supports `--start_epoch`, preserves the source dtype, and can average a folder of saved checkpoints without retraining. See [Advanced Training §1.20](./docs/train_network_advanced.md#120-post-hoc-ema-over-saved-lora-checkpoints--学習後のlora-emaスクリプト).
     - **Mixed caption mode** (`caption_mode = "mixed"`) lets each image use tag captions, `_nl` natural-language captions, or either concatenation order. Per-subset probabilities are controlled by `mixed_weights`. See [Advanced Training §1.18](./docs/train_network_advanced.md#118-mixed-caption-mode-and-protected-tags--混合キャプションモードと保護タグ).
@@ -99,6 +100,7 @@ If you find this project helpful, please consider supporting its development via
 * **LUMINA**
 * **HunyuanImage-2.1**
 * **Anima**
+* **Krea 2 RAW** (LoRA training; experimental)
 
 ### Features
 
@@ -125,6 +127,7 @@ If you find this project helpful, please consider supporting its development via
 * [Textual Inversion Training](./docs/train_textual_inversion.md)
 * [ControlNet-LLLite Training](./docs/train_lllite_README.md) / [Japanese version](./docs/train_lllite_README-ja.md)
 * [Anima ControlNet-LLLite Training Guide](./docs/anima_train_control_net_lllite.md)
+* [Krea 2 LoRA Training](./docs/krea2_train_network.md)
 * [Validation](./docs/validation.md)
 * [Masked Loss Training](./docs/masked_loss_README.md) / [Japanese version](./docs/masked_loss_README-ja.md)
 * [Inpainting Training](./docs/inpainting_training.md)
