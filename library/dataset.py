@@ -1000,6 +1000,8 @@ class BaseDataset(torch.utils.data.Dataset):
         text_encoding_strategy = TextEncodingStrategy.get_strategy()
         caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
         batch_size = caching_strategy.batch_size or self.batch_size
+        requires_processed_captions = getattr(caching_strategy, "requires_processed_captions", False)
+        processed_captions = {}
 
         logger.info("caching Text Encoder outputs with caching strategy.")
         image_infos = list(self.image_data.values())
@@ -1024,9 +1026,37 @@ class BaseDataset(torch.utils.data.Dataset):
                 if i % num_processes != process_index:
                     continue
 
+                if requires_processed_captions:
+                    subset = self.image_to_subset[info.image_key]
+                    caption, _ = self.process_caption(
+                        subset,
+                        info.caption,
+                        getattr(info, "caption_nl", None),
+                        skip_caption_dropout=True,
+                    )
+                    processed_captions[info.image_key] = caption
+
                 cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
+                if (
+                    cache_available
+                    and requires_processed_captions
+                    and hasattr(caching_strategy, "is_disk_cached_outputs_expected_for_caption")
+                ):
+                    cache_available = caching_strategy.is_disk_cached_outputs_expected_for_caption(
+                        te_out_npz, processed_captions[info.image_key]
+                    )
                 if cache_available:  # do not add to batch
                     continue
+
+            elif requires_processed_captions:
+                subset = self.image_to_subset[info.image_key]
+                caption, _ = self.process_caption(
+                    subset,
+                    info.caption,
+                    getattr(info, "caption_nl", None),
+                    skip_caption_dropout=True,
+                )
+                processed_captions[info.image_key] = caption
 
             batch.append(info)
 
@@ -1045,6 +1075,16 @@ class BaseDataset(torch.utils.data.Dataset):
         # iterate batches
         logger.info("caching Text Encoder outputs...")
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
+            if requires_processed_captions:
+                caching_strategy.cache_batch_outputs(
+                    tokenize_strategy,
+                    models,
+                    text_encoding_strategy,
+                    batch,
+                    captions=[processed_captions[info.image_key] for info in batch],
+                )
+                continue
+
             # keep_tokens_separator is control syntax, not caption content.
             original_captions = {}
             for info in batch:
@@ -1442,11 +1482,19 @@ class BaseDataset(torch.utils.data.Dataset):
 
             # new implementation with padding support
             result = []
+
+            def convert(value):
+                # Some large model caches (for example Krea 2's stacked
+                # Qwen3-VL hidden states) are returned as tensors so bfloat16
+                # can be preserved exactly. Avoid expanding those caches to
+                # float32 merely because NumPy has no native bfloat16 dtype.
+                return value if isinstance(value, torch.Tensor) else converter(value)
+
             for i in range(len(tensors_list[0])):
                 tensors = [x[i] for x in tensors_list]
                 if tensors[0].ndim == 0:
                     # scalar value: e.g. ocr mask
-                    result.append(torch.stack([converter(x[i]) for x in tensors_list]))
+                    result.append(torch.stack([convert(x) for x in tensors]))
                     continue
 
                 min_len = min([len(x) for x in tensors])
@@ -1454,16 +1502,28 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 if min_len == max_len:
                     # no padding
-                    result.append(torch.stack([converter(x) for x in tensors]))
+                    result.append(torch.stack([convert(x) for x in tensors]))
                 else:
                     # padding
-                    tensors = [converter(x) for x in tensors]
+                    tensors = [convert(x) for x in tensors]
                     if tensors[0].ndim == 1:
                         # input_ids or mask
                         result.append(torch.stack([(torch.nn.functional.pad(x, (0, max_len - x.shape[0]))) for x in tensors]))
                     else:
-                        # text encoder outputs
-                        result.append(torch.stack([(torch.nn.functional.pad(x, (0, 0, 0, max_len - x.shape[0]))) for x in tensors]))
+                        # Text encoder outputs may be [seq, hidden] or a
+                        # higher-rank stack such as [seq, layers, hidden]. Pad
+                        # the leading sequence dimension for either shape.
+                        result.append(
+                            torch.stack(
+                                [
+                                    torch.nn.functional.pad(
+                                        x,
+                                        (0, 0) * (x.ndim - 1) + (0, max_len - x.shape[0]),
+                                    )
+                                    for x in tensors
+                                ]
+                            )
+                        )
             return result
 
         # set example
