@@ -23,7 +23,9 @@ in ``library.accelerator_setup``; that module has no cycle with this one so it
 is imported directly.
 """
 
+import contextlib
 import glob
+import hashlib
 import importlib
 import logging
 import math
@@ -103,6 +105,35 @@ except:
 
 TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX = "_te_outputs.npz"
 TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX_SD3 = "_sd3_te.npz"
+
+
+def should_keep_vae_for_training(cache_latents: bool, train_inpainting: bool) -> bool:
+    """Keep the VAE when pixels still need encoding during training."""
+
+    return not cache_latents or train_inpainting
+
+
+@contextlib.contextmanager
+def _temporary_random_seed(seed: int):
+    """Temporarily seed Python's RNG without perturbing the caller's state."""
+
+    state = random.getstate()
+    random.seed(seed)
+    try:
+        yield
+    finally:
+        random.setstate(state)
+
+
+def _caption_variant_seed(dataset_seed: int, image_path: str, variant_idx: int) -> int:
+    """Build a stable per-image/per-variant seed independent of cache order."""
+
+    normalized_path = os.path.normcase(os.path.abspath(image_path))
+    payload = "\0".join(
+        (str(int(dataset_seed)), normalized_path, str(int(variant_idx)))
+    ).encode("utf-8", errors="surrogatepass")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
 
 def split_train_val(
     paths: List[str],
@@ -1114,7 +1145,7 @@ class BaseDataset(torch.utils.data.Dataset):
     def new_cache_text_encoder_outputs_variants(
         self, num_variants: int, models: List[Any], accelerator: Accelerator
     ):
-        """Cache independently processed caption variants for each image."""
+        """Cache deterministic, independently processed caption variants."""
         tokenize_strategy = TokenizeStrategy.get_strategy()
         text_encoding_strategy = TextEncodingStrategy.get_strategy()
         caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
@@ -1139,20 +1170,40 @@ class BaseDataset(torch.utils.data.Dataset):
                 if i % num_processes != process_index:
                     continue
 
+                subset = self.image_to_subset[info.image_key]
+                seed = _caption_variant_seed(
+                    getattr(self, "seed", 0), info.absolute_path, variant_idx
+                )
+                with _temporary_random_seed(seed):
+                    caption, _ = self.process_caption(
+                        subset,
+                        info.caption,
+                        info.caption_nl,
+                        skip_caption_dropout=True,
+                    )
+
                 if caching_strategy.cache_to_disk:
                     variant_npz_path = caching_strategy.get_variant_outputs_npz_path(
                         info.absolute_path, variant_idx
                     )
-                    if caching_strategy.is_disk_cached_outputs_expected(variant_npz_path):
+                    cache_available = caching_strategy.is_disk_cached_outputs_expected(
+                        variant_npz_path
+                    )
+                    if (
+                        cache_available
+                        and hasattr(
+                            caching_strategy,
+                            "is_disk_cached_outputs_expected_for_caption",
+                        )
+                    ):
+                        cache_available = (
+                            caching_strategy.is_disk_cached_outputs_expected_for_caption(
+                                variant_npz_path, caption
+                            )
+                        )
+                    if cache_available:
                         continue
 
-                subset = self.image_to_subset[info.image_key]
-                caption, _ = self.process_caption(
-                    subset,
-                    info.caption,
-                    info.caption_nl,
-                    skip_caption_dropout=True,
-                )
                 batch.append(info)
                 batch_captions.append(caption)
 
@@ -1259,6 +1310,23 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return image
 
+    def _load_cached_image_for_inpainting(
+        self, subset: BaseSubset, image_info: ImageInfo, flipped: bool
+    ) -> np.ndarray:
+        """Reload the image with the same preprocessing used by latent caching."""
+
+        image = load_image(image_info.absolute_path, subset.alpha_mask)
+        image, _, _ = trim_and_resize_if_required(
+            subset.random_crop,
+            image,
+            image_info.bucket_reso,
+            image_info.resized_size,
+            resize_interpolation=image_info.resize_interpolation,
+        )
+        if flipped:
+            image = image[:, ::-1, :].copy()
+        return image[:, :, :3]
+
     def __len__(self):
         return self._length
 
@@ -1293,6 +1361,7 @@ class BaseDataset(torch.utils.data.Dataset):
             loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
 
             flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
+            inpainting_image = None
 
             # image/latentsを処理する
             if image_info.latents is not None:  # cache_latents=Trueの場合
@@ -1306,6 +1375,10 @@ class BaseDataset(torch.utils.data.Dataset):
                     alpha_mask = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, [1])
 
                 image = None
+                if self.train_inpainting:
+                    inpainting_image = self._load_cached_image_for_inpainting(
+                        subset, image_info, flipped
+                    )
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
                 latents, original_size, crop_ltrb, flipped_latents, alpha_mask = (
                     self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso)
@@ -1319,6 +1392,10 @@ class BaseDataset(torch.utils.data.Dataset):
                     alpha_mask = torch.FloatTensor(alpha_mask)
 
                 image = None
+                if self.train_inpainting:
+                    inpainting_image = self._load_cached_image_for_inpainting(
+                        subset, image_info, flipped
+                    )
             else:
                 # 画像を読み込み、必要ならcropする
                 img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(
@@ -1378,18 +1455,24 @@ class BaseDataset(torch.utils.data.Dataset):
                     alpha_mask = None
 
                 img = img[:, :, :3]  # remove alpha channel
-
                 if self.train_inpainting:
-                    pil_image = transforms.functional.to_pil_image(img)
-                    mask = self.random_mask(pil_image.size)
-                    mask, masked_image = self.prepare_mask_and_masked_image(pil_image, mask)
-
-                    masks.append(mask)
-                    masked_images.append(masked_image)
+                    inpainting_image = img
 
                 latents = None
                 image = self.image_transforms(img)  # -1.0~1.0のtorch.Tensorになる
                 del img
+
+            if self.train_inpainting:
+                if inpainting_image is None:
+                    raise RuntimeError(
+                        f"failed to prepare inpainting input for {image_info.absolute_path}"
+                    )
+                pil_image = transforms.functional.to_pil_image(inpainting_image)
+                mask = self.random_mask(pil_image.size)
+                mask, masked_image = self.prepare_mask_and_masked_image(pil_image, mask)
+                masks.append(mask)
+                masked_images.append(masked_image)
+                del inpainting_image
 
             images.append(image)
             latents_list.append(latents)

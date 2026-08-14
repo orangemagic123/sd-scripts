@@ -53,6 +53,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+import library.model_io as model_io
 from library.utils import setup_logging
 
 setup_logging()
@@ -220,6 +221,20 @@ def _load_state_dict(
     return sd, metadata, source_dtype
 
 
+def _refresh_safetensors_hash_metadata(state_dict: dict, metadata: dict) -> dict:
+    """Return metadata whose additional-networks hashes match ``state_dict``."""
+
+    refreshed = dict(metadata or {})
+    refreshed.pop("sshs_model_hash", None)
+    refreshed.pop("sshs_legacy_hash", None)
+    model_hash, legacy_hash = model_io.precalculate_safetensors_hashes(
+        state_dict, refreshed
+    )
+    refreshed["sshs_model_hash"] = model_hash
+    refreshed["sshs_legacy_hash"] = legacy_hash
+    return refreshed
+
+
 def _save_state_dict(file_name: str, state_dict: dict, dtype, metadata: dict):
     # safetensors.save_file requires CPU tensors; torch.save accepts any device
     # but we normalize to CPU anyway so the saved file is portable.
@@ -233,7 +248,14 @@ def _save_state_dict(file_name: str, state_dict: dict, dtype, metadata: dict):
             state_dict[key] = t
 
     if os.path.splitext(file_name)[1] == ".safetensors":
-        save_file(state_dict, file_name, metadata=metadata if metadata else None)
+        refreshed_metadata = _refresh_safetensors_hash_metadata(
+            state_dict, metadata
+        )
+        save_file(
+            state_dict,
+            file_name,
+            metadata=refreshed_metadata if refreshed_metadata else None,
+        )
     else:
         torch.save(state_dict, file_name)
 
