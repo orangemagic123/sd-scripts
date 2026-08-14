@@ -30,6 +30,17 @@ jobs:
           base64 --decode /tmp/apply_review_fixes.b64 | gzip --decompress > /tmp/apply_review_fixes.py
           echo 'bf37a92aa17b25f44e5df8e52670e7de8098de9117b97051cff152be0bd206d0  /tmp/apply_review_fixes.py' | sha256sum -c -
           python /tmp/apply_review_fixes.py
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('networks/lora_tlora_anima.py')
+          text = path.read_text(encoding='utf-8')
+          helper_start = text.index('    def get_timestep_rank_mask')
+          helper_end = text.index('        return mask\n', helper_start) + len('        return mask\n')
+          next_method = text.index('    def set_multiplier', helper_end)
+          text = text[:helper_end] + '\n' + text[next_method:]
+          path.write_text(text, encoding='utf-8')
+          PY
           python -m compileall -q train_network.py networks/lora_tlora.py networks/lora_tlora_anima.py networks/tlora_utils.py tests/test_tlora_regressions.py tests/test_network_training_regressions.py
           git diff --check
 
