@@ -120,6 +120,43 @@ def _update_ema_model(ema_model, source_model, decay: float):
             ema_buffers[name].copy_(buffer)
 
 
+def _should_sample_at_step(args, step: int) -> bool:
+    """Return whether a step-triggered sample will actually be generated."""
+
+    if step == 0:
+        return bool(getattr(args, "sample_at_first", False))
+    if getattr(args, "sample_every_n_epochs", None) is not None:
+        return False
+    interval = getattr(args, "sample_every_n_steps", None)
+    return interval is not None and interval > 0 and step % interval == 0
+
+
+@contextlib.contextmanager
+def _network_eval_scope(network):
+    """Temporarily disable adapter dropout and restore the previous mode."""
+
+    was_training = network.training
+    network.eval()
+    try:
+        yield
+    finally:
+        network.train(was_training)
+
+
+def _select_batch_items(value, indices: torch.Tensor, batch_size: int):
+    """Select matching batch entries while leaving scalar metadata untouched."""
+
+    if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+        return value.index_select(0, indices.to(value.device))
+    if isinstance(value, list) and len(value) == batch_size:
+        selected = indices.detach().cpu().tolist()
+        return [value[index] for index in selected]
+    if isinstance(value, tuple) and len(value) == batch_size:
+        selected = indices.detach().cpu().tolist()
+        return tuple(value[index] for index in selected)
+    return value
+
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -372,21 +409,37 @@ class NetworkTrainer:
                     diff_output_pr_indices.append(i)
 
             if len(diff_output_pr_indices) > 0:
+                indices = torch.as_tensor(
+                    diff_output_pr_indices, device=unet_latents.device, dtype=torch.long
+                )
+                prior_latents = unet_latents.index_select(0, indices)
+                prior_timesteps = timesteps.index_select(0, indices.to(timesteps.device))
+                prior_text_encoder_conds = [
+                    _select_batch_items(cond, indices, noisy_latents.shape[0])
+                    for cond in text_encoder_conds
+                ]
+                prior_batch = {
+                    key: _select_batch_items(value, indices, noisy_latents.shape[0])
+                    for key, value in batch.items()
+                }
+
+                previous_multiplier = getattr(network, "multiplier", 1.0)
                 network.set_multiplier(0.0)
-                with torch.no_grad(), accelerator.autocast():
-                    noise_pred_prior = self.call_unet(
-                        args,
-                        accelerator,
-                        unet,
-                        noisy_latents,
-                        timesteps,
-                        text_encoder_conds,
-                        batch,
-                        weight_dtype,
-                        indices=diff_output_pr_indices,
-                    )
-                network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
-                target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
+                try:
+                    with torch.no_grad(), accelerator.autocast():
+                        noise_pred_prior = self.call_unet(
+                            args,
+                            accelerator,
+                            unet,
+                            prior_latents,
+                            prior_timesteps,
+                            prior_text_encoder_conds,
+                            prior_batch,
+                            weight_dtype,
+                        )
+                finally:
+                    network.set_multiplier(previous_multiplier)
+                target.index_copy_(0, indices.to(target.device), noise_pred_prior.to(target.dtype))
 
         return noise_pred, target, timesteps, None
 
@@ -1609,11 +1662,16 @@ class NetworkTrainer:
             gc.collect()
             clean_memory_on_device(accelerator.device)
 
-        # For --sample_at_first
-        optimizer_eval_fn()
-        with _ema_scope(accelerator.unwrap_model(network), ema_network):
-            self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
-        optimizer_train_fn()
+        # For --sample_at_first. Avoid optimizer/EMA state transitions when
+        # the sampling function would immediately return.
+        if _should_sample_at_step(args, global_step):
+            optimizer_eval_fn()
+            unwrapped_nw = accelerator.unwrap_model(network)
+            with _network_eval_scope(unwrapped_nw), _ema_scope(unwrapped_nw, ema_network):
+                self.sample_images(
+                    accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
+                )
+            optimizer_train_fn()
         is_tracking = len(accelerator.trackers) > 0
         if is_tracking:
             # log empty object to commit the sample images to wandb
@@ -1659,7 +1717,7 @@ class NetworkTrainer:
             elif accelerator.device.type == "xpu":
                 gpu_rng_state = torch.xpu.get_rng_state()
             elif accelerator.device.type == "mps":
-                gpu_rng_state = torch.cuda.get_rng_state()
+                gpu_rng_state = torch.mps.get_rng_state()
             else:
                 gpu_rng_state = None
             python_rng_state = random.getstate()
@@ -1678,7 +1736,7 @@ class NetworkTrainer:
                 elif accelerator.device.type == "xpu":
                     torch.xpu.set_rng_state(gpu_rng_state)
                 elif accelerator.device.type == "mps":
-                    torch.cuda.set_rng_state(gpu_rng_state)
+                    torch.mps.set_rng_state(gpu_rng_state)
             random.setstate(python_rng_state)
 
         for epoch in range(epoch_to_start, num_train_epochs):
@@ -1697,7 +1755,7 @@ class NetworkTrainer:
 
             # Average micro-batch losses over each gradient accumulation cycle so
             # tracker steps stay aligned with optimizer/global steps.
-            accum_loss_sum = 0.0
+            accum_loss_sum = None
             accum_loss_count = 0
             optimizer_step_in_epoch = 0
 
@@ -1763,7 +1821,8 @@ class NetworkTrainer:
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
-                accum_loss_sum += loss.detach().item()
+                detached_loss = loss.detach()
+                accum_loss_sum = detached_loss if accum_loss_sum is None else accum_loss_sum + detached_loss
                 accum_loss_count += 1
 
                 if args.scale_weight_norms:
@@ -1797,11 +1856,22 @@ class NetworkTrainer:
                     progress_bar.update(1)
                     global_step += 1
 
-                    optimizer_eval_fn()
-                    with _ema_scope(accelerator.unwrap_model(network), ema_network):
-                        self.sample_images(
-                            accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
-                        )
+                    if _should_sample_at_step(args, global_step):
+                        optimizer_eval_fn()
+                        unwrapped_nw = accelerator.unwrap_model(network)
+                        with _network_eval_scope(unwrapped_nw), _ema_scope(unwrapped_nw, ema_network):
+                            self.sample_images(
+                                accelerator,
+                                args,
+                                None,
+                                global_step,
+                                accelerator.device,
+                                vae,
+                                tokenizers,
+                                text_encoder,
+                                unet,
+                            )
+                        optimizer_train_fn()
                     progress_bar.unpause()
 
                     # 指定ステップごとにモデルを保存
@@ -1828,8 +1898,8 @@ class NetworkTrainer:
                                 self._remove_model(args=args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name)
                     optimizer_train_fn()
 
-                    current_loss = accum_loss_sum / accum_loss_count
-                    accum_loss_sum = 0.0
+                    current_loss = (accum_loss_sum / accum_loss_count).item()
+                    accum_loss_sum = None
                     accum_loss_count = 0
 
                     loss_recorder.add(epoch=epoch, step=optimizer_step_in_epoch, loss=current_loss)

@@ -15,6 +15,7 @@ import re
 
 from library.utils import setup_logging
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
+from networks.tlora_utils import build_rank_mask, timestep_progress, validate_tlora_schedule
 
 setup_logging()
 import logging
@@ -85,6 +86,7 @@ class TLoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        self.enabled = True
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -93,6 +95,9 @@ class TLoRAModule(torch.nn.Module):
 
     def forward(self, x):
         org_forwarded = self.org_forward(x)
+
+        if not self.enabled:
+            return org_forwarded
 
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
@@ -104,24 +109,21 @@ class TLoRAModule(torch.nn.Module):
         if self.dropout is not None and self.training:
             lx = torch.nn.functional.dropout(lx, p=self.dropout)
 
-        # T-LoRA: apply timestep-dependent sigma mask (only for UNet modules)
+        # T-LoRA: apply a separate active-rank mask to every batch item.
         sigma_mask = None
         if self.is_unet and self.network is not None:
-            sigma_mask = self.network.current_sigma_mask
+            sigma_mask = self.network.get_timestep_rank_mask(
+                self.lora_dim, lx.size(0), lx.device, lx.dtype
+            )
 
         if sigma_mask is not None:
-            sm = sigma_mask
-            if self.lora_dim != sm.shape[-1]:
-                r = self.network.current_sigma_r if self.network.current_sigma_r is not None else self.lora_dim
-                r = min(self.lora_dim, r)
-                sm = torch.ones((1, self.lora_dim), device=lx.device)
-                sm[:, r:] = 0.0
-
-            if len(lx.size()) == 3:
-                sm = sm.unsqueeze(1)
-            elif len(lx.size()) == 4:
-                sm = sm.unsqueeze(-1).unsqueeze(-1)
-            lx = lx * sm
+            if self.is_conv2d:
+                sigma_mask = sigma_mask.unsqueeze(-1).unsqueeze(-1)
+            else:
+                sigma_mask = sigma_mask.view(
+                    sigma_mask.shape[0], *([1] * (lx.ndim - 2)), sigma_mask.shape[1]
+                )
+            lx = lx * sigma_mask
 
         # rank dropout (applied additionally if specified, after sigma mask)
         if self.rank_dropout is not None and self.training:
@@ -259,6 +261,7 @@ class OrthogonalTLoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        self.enabled = True
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -277,52 +280,76 @@ class OrthogonalTLoRAModule(torch.nn.Module):
     def forward(self, x):
         org_forwarded = self.org_forward(x)
 
+        if not self.enabled:
+            return org_forwarded
+
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
         orig_dtype = x.dtype
         dtype = self.q_layer.weight.dtype
+        x_dt = x.to(dtype)
 
-        # Get effective rank from network (set by hook); default to full rank
-        r = self.lora_dim
-        if self.is_unet and self.network is not None and self.network.current_sigma_r is not None:
-            r = min(self.network.current_sigma_r, self.lora_dim)
+        rank_mask = None
+        if self.is_unet and self.network is not None:
+            rank_mask = self.network.get_timestep_rank_mask(
+                self.lora_dim, x.size(0), x.device, dtype
+            )
+
+        scale = self.scale
+        if self.rank_dropout is not None and self.training:
+            dropout_mask = (
+                torch.rand((x.size(0), self.lora_dim), device=x.device) > self.rank_dropout
+            ).to(dtype=dtype)
+            rank_mask = dropout_mask if rank_mask is None else rank_mask * dropout_mask
+            scale *= 1.0 / (1.0 - self.rank_dropout)
 
         if self.is_conv2d:
-            q_weight = self.q_layer.weight[:r].reshape(r, self.conv_in_channels, *self.conv_kernel_size)
-            base_q_weight = self.base_q.weight[:r].reshape(r, self.conv_in_channels, *self.conv_kernel_size)
-            p_weight = self.p_layer.weight[:, :r].reshape(self.p_layer.weight.shape[0], r, 1, 1)
-            base_p_weight = self.base_p.weight[:, :r].reshape(self.base_p.weight.shape[0], r, 1, 1)
+            q_weight = self.q_layer.weight.reshape(
+                self.lora_dim, self.conv_in_channels, *self.conv_kernel_size
+            )
+            base_q_weight = self.base_q.weight.reshape(
+                self.lora_dim, self.conv_in_channels, *self.conv_kernel_size
+            )
+            p_weight = self.p_layer.weight.reshape(
+                self.p_layer.weight.shape[0], self.lora_dim, 1, 1
+            )
+            base_p_weight = self.base_p.weight.reshape(
+                self.base_p.weight.shape[0], self.lora_dim, 1, 1
+            )
 
-            x_dt = x.to(dtype)
-            lx = torch.nn.functional.conv2d(x_dt, q_weight, stride=self.conv_stride, padding=self.conv_padding)
-            lx = lx * self.lambda_layer[:, :r].unsqueeze(-1).unsqueeze(-1)
+            lx = torch.nn.functional.conv2d(
+                x_dt, q_weight, stride=self.conv_stride, padding=self.conv_padding
+            )
+            base_lx = torch.nn.functional.conv2d(
+                x_dt, base_q_weight, stride=self.conv_stride, padding=self.conv_padding
+            )
+            lx = lx * self.lambda_layer.unsqueeze(-1).unsqueeze(-1)
+            base_lx = base_lx * self.base_lambda_buf.unsqueeze(-1).unsqueeze(-1)
+            if rank_mask is not None:
+                conv_mask = rank_mask.unsqueeze(-1).unsqueeze(-1)
+                lx = lx * conv_mask
+                base_lx = base_lx * conv_mask
             lx = torch.nn.functional.conv2d(lx, p_weight)
-
-            base_lx = torch.nn.functional.conv2d(x_dt, base_q_weight, stride=self.conv_stride, padding=self.conv_padding)
-            base_lx = base_lx * self.base_lambda_buf[:, :r].unsqueeze(-1).unsqueeze(-1)
             base_lx = torch.nn.functional.conv2d(base_lx, base_p_weight)
         else:
-            x_dt = x.to(dtype)
-            q_w = self.q_layer.weight[:r]
-            p_w = self.p_layer.weight[:, :r]
-            lam = self.lambda_layer[:, :r]
-            lx = torch.nn.functional.linear(x_dt, q_w) * lam
-            lx = torch.nn.functional.linear(lx, p_w)
+            lx = torch.nn.functional.linear(x_dt, self.q_layer.weight) * self.lambda_layer
+            base_lx = torch.nn.functional.linear(x_dt, self.base_q.weight) * self.base_lambda_buf
+            if rank_mask is not None:
+                linear_mask = rank_mask.view(
+                    rank_mask.shape[0], *([1] * (lx.ndim - 2)), rank_mask.shape[1]
+                )
+                lx = lx * linear_mask
+                base_lx = base_lx * linear_mask
+            lx = torch.nn.functional.linear(lx, self.p_layer.weight)
+            base_lx = torch.nn.functional.linear(base_lx, self.base_p.weight)
 
-            base_q_w = self.base_q.weight[:r]
-            base_p_w = self.base_p.weight[:, :r]
-            base_lam = self.base_lambda_buf[:, :r]
-            base_lx = torch.nn.functional.linear(x_dt, base_q_w) * base_lam
-            base_lx = torch.nn.functional.linear(base_lx, base_p_w)
-
-        # normal dropout
         result = lx - base_lx
         if self.dropout is not None and self.training:
             result = torch.nn.functional.dropout(result, p=self.dropout)
 
-        return org_forwarded + result.to(orig_dtype) * self.multiplier * self.scale
+        return org_forwarded + result.to(orig_dtype) * self.multiplier * scale
 
 
 
@@ -341,17 +368,11 @@ from transformers import CLIPTextModel
 
 
 def get_timestep_sigma_mask(timestep, max_timestep, max_rank, min_rank=1, alpha=1.0):
-    """
-    Compute the T-LoRA sigma mask based on the current timestep.
-    Lower timesteps (less noise) -> higher effective rank.
-    Higher timesteps (more noise) -> lower effective rank.
-    """
-    t = timestep.item() if isinstance(timestep, torch.Tensor) else timestep
-    r = int(((max_timestep - t) / max_timestep) ** alpha * (max_rank - min_rank)) + min_rank
-    r = max(min_rank, min(r, max_rank))  # clamp
-    sigma_mask = torch.zeros((1, max_rank))
-    sigma_mask[:, :r] = 1.0
-    return sigma_mask
+    """Compute a per-sample T-LoRA rank mask."""
+
+    device = timestep.device if isinstance(timestep, torch.Tensor) else None
+    progress = timestep_progress(timestep, max_timestep, alpha, device=device)
+    return build_rank_mask(progress, max_rank, min_rank, device=device)
 
 
 class TLoRANetwork(torch.nn.Module):
@@ -407,6 +428,7 @@ class TLoRANetwork(torch.nn.Module):
         self.module_dropout = module_dropout
 
         # T-LoRA params
+        validate_tlora_schedule(tlora_max_timestep, tlora_min_rank, tlora_alpha_rank_scale)
         self.tlora_min_rank = tlora_min_rank
         self.tlora_alpha_rank_scale = tlora_alpha_rank_scale
         self.tlora_max_timestep = tlora_max_timestep
@@ -414,6 +436,8 @@ class TLoRANetwork(torch.nn.Module):
         self.tlora_sig_type = tlora_sig_type
         self.current_sigma_mask = None
         self.current_sigma_r = None
+        self.current_timestep_progress = None
+        self._rank_mask_cache = {}
 
         self.loraplus_lr_ratio = None
         self.loraplus_unet_lr_ratio = None
@@ -529,7 +553,7 @@ class TLoRANetwork(torch.nn.Module):
             skipped_te += skipped
         logger.info(f"create T-LoRA for Text Encoder: {len(self.text_encoder_loras)} modules.")
 
-        target_modules = TLoRANetwork.UNET_TARGET_REPLACE_MODULE
+        target_modules = list(TLoRANetwork.UNET_TARGET_REPLACE_MODULE)
         if modules_dim is not None or self.conv_lora_dim is not None or conv_block_dims is not None:
             target_modules += TLoRANetwork.UNET_TARGET_REPLACE_MODULE_CONV2D_3X3
 
@@ -553,9 +577,8 @@ class TLoRANetwork(torch.nn.Module):
             names.add(lora.lora_name)
 
     def _unet_forward_pre_hook(self, module, args, kwargs=None):
-        """Hook to capture timestep from UNet forward call and compute sigma_mask."""
-        # SdxlUNet2DConditionModel.forward(self, x, timesteps=None, context=None, y=None, **kwargs)
-        # Standard UNet: forward(sample, timestep, encoder_hidden_states, ...)
+        """Capture every sample's timestep and reset the per-forward mask cache."""
+
         timestep = None
         if len(args) >= 2:
             timestep = args[1]
@@ -564,23 +587,52 @@ class TLoRANetwork(torch.nn.Module):
         elif kwargs is not None and "timestep" in kwargs:
             timestep = kwargs["timestep"]
 
-        if timestep is not None:
-            target_device = None
-            if len(args) >= 1 and isinstance(args[0], torch.Tensor):
-                target_device = args[0].device
+        if timestep is None:
+            self.current_timestep_progress = None
+            self.current_sigma_mask = None
+            self.current_sigma_r = None
+            self._rank_mask_cache = {}
+            return
 
-            if isinstance(timestep, torch.Tensor):
-                t = timestep.flatten()[0] if timestep.dim() > 0 else timestep
-                t = t.item()
-            else:
-                t = timestep
-            r = int(((self.tlora_max_timestep - t) / self.tlora_max_timestep) ** self.tlora_alpha_rank_scale
-                    * (self.lora_dim - self.tlora_min_rank)) + self.tlora_min_rank
-            r = max(self.tlora_min_rank, min(r, self.lora_dim))
-            mask = torch.zeros((1, self.lora_dim), device=target_device)
-            mask[:, :r] = 1.0
-            self.current_sigma_mask = mask
-            self.current_sigma_r = r
+        target_device = None
+        batch_size = None
+        if len(args) >= 1 and isinstance(args[0], torch.Tensor):
+            target_device = args[0].device
+            batch_size = args[0].shape[0]
+
+        self.current_timestep_progress = timestep_progress(
+            timestep,
+            self.tlora_max_timestep,
+            self.tlora_alpha_rank_scale,
+            device=target_device,
+        )
+        self._rank_mask_cache = {}
+        self.current_sigma_mask = self.get_timestep_rank_mask(
+            self.lora_dim,
+            batch_size or self.current_timestep_progress.numel(),
+            target_device or self.current_timestep_progress.device,
+            torch.float32,
+        )
+        self.current_sigma_r = self.current_sigma_mask.sum(dim=1)
+
+    def get_timestep_rank_mask(self, rank, batch_size, device, dtype):
+        if self.current_timestep_progress is None:
+            return None
+
+        device = torch.device(device)
+        key = (int(rank), int(batch_size), device.type, device.index, dtype)
+        mask = self._rank_mask_cache.get(key)
+        if mask is None:
+            mask = build_rank_mask(
+                self.current_timestep_progress,
+                rank,
+                self.tlora_min_rank,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+            )
+            self._rank_mask_cache[key] = mask
+        return mask
 
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
@@ -621,9 +673,14 @@ class TLoRANetwork(torch.nn.Module):
             logger.info("registered T-LoRA timestep hook on UNet")
 
     def is_mergeable(self):
-        return True
+        # A timestep-dependent adapter cannot be represented by one static
+        # base-weight merge without changing its inference semantics.
+        return False
 
     def merge_to(self, text_encoder, unet, weights_sd, dtype, device):
+        raise NotImplementedError("T-LoRA weights must remain as a runtime adapter and cannot be statically merged")
+
+    def _legacy_merge_to(self, text_encoder, unet, weights_sd, dtype, device):
         apply_text_encoder = apply_unet = False
         for key in weights_sd.keys():
             if key.startswith(TLoRANetwork.LORA_PREFIX_TEXT_ENCODER):
@@ -754,12 +811,18 @@ class TLoRANetwork(torch.nn.Module):
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if isinstance(lora, OrthogonalTLoRAModule):
+                for param in lora.base_q.parameters():
+                    param.requires_grad_(False)
+                for param in lora.base_p.parameters():
+                    param.requires_grad_(False)
 
     def on_epoch_start(self, text_encoder, unet):
         self.train()
 
     def get_trainable_params(self):
-        return self.parameters()
+        return (param for param in self.parameters() if param.requires_grad)
 
     def save_weights(self, file, dtype, metadata):
         if metadata is not None and len(metadata) == 0:

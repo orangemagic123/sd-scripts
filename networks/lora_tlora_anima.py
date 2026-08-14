@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from library.utils import setup_logging
+from networks.tlora_utils import build_rank_mask, timestep_progress, validate_tlora_schedule
 
 setup_logging()
 import logging
@@ -22,19 +23,11 @@ logger = logging.getLogger(__name__)
 
 
 def get_timestep_sigma_mask(timestep, max_timestep, max_rank, min_rank=1, alpha=1.0):
-    """
-    Compute the T-LoRA sigma mask based on the current timestep.
-    Lower timesteps (less noise) -> higher effective rank.
-    Higher timesteps (more noise) -> lower effective rank.
+    """Compute a per-sample T-LoRA mask for Anima flow-matching timesteps."""
 
-    For Anima, timesteps are in [0, 1] range (Flow Matching).
-    """
-    t = timestep.item() if isinstance(timestep, torch.Tensor) else timestep
-    r = int(((max_timestep - t) / max_timestep) ** alpha * (max_rank - min_rank)) + min_rank
-    r = max(min_rank, min(r, max_rank))
-    sigma_mask = torch.zeros((1, max_rank))
-    sigma_mask[:, :r] = 1.0
-    return sigma_mask
+    device = timestep.device if isinstance(timestep, torch.Tensor) else None
+    progress = timestep_progress(timestep, max_timestep, alpha, device=device)
+    return build_rank_mask(progress, max_rank, min_rank, device=device)
 
 
 class TLoRAModule(torch.nn.Module):
@@ -116,59 +109,51 @@ class TLoRAModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        # Determine effective rank from the network hook (DiT path only).
-        # We then SLICE the down/up weights to the first r components instead
-        # of running the full matmul and zeroing out the tail with a mask.
-        # This eliminates one elementwise kernel per adapter per forward and,
-        # when r < lora_dim (high-noise timesteps), shrinks both matmuls.
-        # When r == lora_dim the slicing returns a view with no copy.
-        #
-        # T-LoRA rank masking is a *training-time* regularisation. At
-        # inference we want the full-rank delta — every component is relevant
-        # because each was trained at its own timestep bracket. The reference
-        # implementation (sorryhyun/anima_lora) gates the mask on
-        # ``self.training`` for exactly this reason; the old sd-scripts port
-        # always sliced and produced degraded samples at generation time.
-        r = self.lora_dim
-        if (
-            self.training
-            and self.is_unet
-            and self.network is not None
-            and self.network.current_sigma_r is not None
-        ):
-            r = min(self.lora_dim, self.network.current_sigma_r)
-
         if self.is_conv2d:
-            down_w = self.lora_down.weight[:r]
-            up_w = self.lora_up.weight[:, :r]
             lx = torch.nn.functional.conv2d(
-                x, down_w, stride=self._conv_stride, padding=self._conv_padding
+                x,
+                self.lora_down.weight,
+                stride=self._conv_stride,
+                padding=self._conv_padding,
             )
         else:
-            down_w = self.lora_down.weight[:r]
-            up_w = self.lora_up.weight[:, :r]
-            lx = torch.nn.functional.linear(x, down_w)
+            lx = torch.nn.functional.linear(x, self.lora_down.weight)
 
         if self.dropout is not None and self.training:
             lx = torch.nn.functional.dropout(lx, p=self.dropout)
 
-        # rank dropout (over effective rank r)
-        if self.rank_dropout is not None and self.training:
-            mask = torch.rand((lx.size(0), r), device=lx.device) > self.rank_dropout
+        rank_mask = None
+        if self.training and self.is_unet and self.network is not None:
+            rank_mask = self.network.get_timestep_rank_mask(
+                self.lora_dim, lx.size(0), lx.device, lx.dtype
+            )
+        if rank_mask is not None:
             if self.is_conv2d:
-                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                lx = lx * rank_mask.unsqueeze(-1).unsqueeze(-1)
             else:
-                for _ in range(len(lx.size()) - 2):
-                    mask = mask.unsqueeze(1)
-            lx = lx * mask
+                lx = lx * rank_mask.view(
+                    rank_mask.shape[0], *([1] * (lx.ndim - 2)), rank_mask.shape[1]
+                )
+
+        if self.rank_dropout is not None and self.training:
+            dropout_mask = torch.rand(
+                (lx.size(0), self.lora_dim), device=lx.device
+            ) > self.rank_dropout
+            if self.is_conv2d:
+                dropout_mask = dropout_mask.unsqueeze(-1).unsqueeze(-1)
+            else:
+                dropout_mask = dropout_mask.view(
+                    dropout_mask.shape[0], *([1] * (lx.ndim - 2)), dropout_mask.shape[1]
+                )
+            lx = lx * dropout_mask
             scale = self.scale * (1.0 / (1.0 - self.rank_dropout))
         else:
             scale = self.scale
 
         if self.is_conv2d:
-            lx = torch.nn.functional.conv2d(lx, up_w)
+            lx = torch.nn.functional.conv2d(lx, self.lora_up.weight)
         else:
-            lx = torch.nn.functional.linear(lx, up_w)
+            lx = torch.nn.functional.linear(lx, self.lora_up.weight)
 
         return org_forwarded + lx * self.multiplier * scale
 
@@ -369,59 +354,64 @@ class OrthogonalTLoRAModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        # Do NOT force-cast x to the adapter weight dtype. Under mixed-precision
-        # autocast, F.linear/conv2d with a bf16/fp16 input and an fp32 weight
-        # will automatically use tensor cores with the correct promotion, which
-        # is much faster than running the whole adapter path in fp32.
+        rank_mask = None
+        if self.training and self.is_unet and self.network is not None:
+            rank_mask = self.network.get_timestep_rank_mask(
+                self.lora_dim, x.size(0), x.device, self.q_layer.weight.dtype
+            )
 
-        # Get effective rank from network (set by hook); default to full rank.
-        # T-LoRA timestep-dependent rank masking is a training-time
-        # regularisation — at inference we use the full rank so the learned
-        # delta matches what the reference anima_lora implementation produces
-        # (which only calls ``set_timestep_mask`` inside the training step).
-        r = self.lora_dim
-        if (
-            self.training
-            and self.is_unet
-            and self.network is not None
-            and self.network.current_sigma_r is not None
-        ):
-            r = min(self.network.current_sigma_r, self.lora_dim)
+        scale = self.scale
+        if self.rank_dropout is not None and self.training:
+            dropout_mask = (
+                torch.rand((x.size(0), self.lora_dim), device=x.device) > self.rank_dropout
+            ).to(dtype=self.q_layer.weight.dtype)
+            rank_mask = dropout_mask if rank_mask is None else rank_mask * dropout_mask
+            scale *= 1.0 / (1.0 - self.rank_dropout)
 
         if self.is_conv2d:
-            # Slice to effective rank r - reduces FLOPs and avoids mask multiplication
-            q_weight = self.q_layer.weight[:r].reshape(r, self.conv_in_channels, *self.conv_kernel_size)
-            base_q_weight = self.base_q.weight[:r].reshape(r, self.conv_in_channels, *self.conv_kernel_size)
-            p_weight = self.p_layer.weight[:, :r].reshape(self.p_layer.weight.shape[0], r, 1, 1)
-            # Use the precomputed base_p * base_lambda merge.
-            base_p_weight = self._base_pl[:, :r].reshape(self._base_pl.shape[0], r, 1, 1)
+            q_weight = self.q_layer.weight.reshape(
+                self.lora_dim, self.conv_in_channels, *self.conv_kernel_size
+            )
+            base_q_weight = self.base_q.weight.reshape(
+                self.lora_dim, self.conv_in_channels, *self.conv_kernel_size
+            )
+            p_weight = self.p_layer.weight.reshape(
+                self.p_layer.weight.shape[0], self.lora_dim, 1, 1
+            )
+            base_p_weight = self._base_pl.reshape(
+                self._base_pl.shape[0], self.lora_dim, 1, 1
+            )
 
-            lx = torch.nn.functional.conv2d(x, q_weight, stride=self.conv_stride, padding=self.conv_padding)
-            lx = lx * self.lambda_layer[:, :r].unsqueeze(-1).unsqueeze(-1)
+            lx = torch.nn.functional.conv2d(
+                x, q_weight, stride=self.conv_stride, padding=self.conv_padding
+            )
+            base_lx = torch.nn.functional.conv2d(
+                x, base_q_weight, stride=self.conv_stride, padding=self.conv_padding
+            )
+            lx = lx * self.lambda_layer.unsqueeze(-1).unsqueeze(-1)
+            if rank_mask is not None:
+                conv_mask = rank_mask.unsqueeze(-1).unsqueeze(-1)
+                lx = lx * conv_mask
+                base_lx = base_lx * conv_mask
             lx = torch.nn.functional.conv2d(lx, p_weight)
-
-            base_lx = torch.nn.functional.conv2d(x, base_q_weight, stride=self.conv_stride, padding=self.conv_padding)
             base_lx = torch.nn.functional.conv2d(base_lx, base_p_weight)
         else:
-            # Slice weights to effective rank r instead of multiplying by mask
-            q_w = self.q_layer.weight[:r]
-            p_w = self.p_layer.weight[:, :r]
-            lam = self.lambda_layer[:, :r]
-            lx = torch.nn.functional.linear(x, q_w) * lam
-            lx = torch.nn.functional.linear(lx, p_w)
-
-            base_q_w = self.base_q.weight[:r]
-            # Precomputed base_p * base_lambda merge — saves one elementwise
-            # kernel per adapter per forward.
-            base_p_w = self._base_pl[:, :r]
-            base_lx = torch.nn.functional.linear(x, base_q_w)
-            base_lx = torch.nn.functional.linear(base_lx, base_p_w)
+            lx = torch.nn.functional.linear(x, self.q_layer.weight) * self.lambda_layer
+            base_lx = torch.nn.functional.linear(x, self.base_q.weight)
+            if rank_mask is not None:
+                linear_mask = rank_mask.view(
+                    rank_mask.shape[0], *([1] * (lx.ndim - 2)), rank_mask.shape[1]
+                )
+                lx = lx * linear_mask
+                base_lx = base_lx * linear_mask
+            lx = torch.nn.functional.linear(lx, self.p_layer.weight)
+            base_lx = torch.nn.functional.linear(base_lx, self._base_pl)
 
         result = lx - base_lx
         if self.dropout is not None and self.training:
             result = torch.nn.functional.dropout(result, p=self.dropout)
 
-        return org_forwarded + result * self.multiplier * self.scale
+        return org_forwarded + result * self.multiplier * scale
 
     @property
     def device(self):
@@ -481,6 +471,7 @@ class TLoRANetwork(torch.nn.Module):
         self.reg_lrs = reg_lrs
 
         # T-LoRA params
+        validate_tlora_schedule(tlora_max_timestep, tlora_min_rank, tlora_alpha_rank_scale)
         self.tlora_min_rank = tlora_min_rank
         self.tlora_alpha_rank_scale = tlora_alpha_rank_scale
         self.tlora_max_timestep = tlora_max_timestep
@@ -488,6 +479,8 @@ class TLoRANetwork(torch.nn.Module):
         self.tlora_sig_type = tlora_sig_type
         self.current_sigma_mask = None
         self.current_sigma_r = None
+        self.current_timestep_progress = None
+        self._rank_mask_cache = {}
 
         self.loraplus_lr_ratio = None
         self.loraplus_unet_lr_ratio = None
@@ -634,27 +627,13 @@ class TLoRANetwork(torch.nn.Module):
             names.add(lora.lora_name)
 
     def _unet_forward_pre_hook(self, module, args, kwargs=None):
-        """Hook to capture timestep from Anima DiT forward and compute the
-        effective T-LoRA rank for this step.
+        """Capture all Anima timesteps and prepare per-sample rank masks."""
 
-        Anima forward: forward(self, x, timesteps, context, ...) where
-        timesteps is in [0, 1] (Flow Matching).
-
-        Both adapter implementations slice their weights to the first r
-        components instead of multiplying by a 0/1 sigma_mask, so the hook
-        only needs to publish ``current_sigma_r`` (a Python int). This avoids
-        a per-step GPU allocation + write for the mask buffer.
-
-        NOTE: T-LoRA rank masking is a training-time regularisation only —
-        inference / sampling must use the full rank, otherwise the LoRA
-        delta is artificially attenuated at high-noise timesteps and image
-        samples come out degraded. We short-circuit here when the network
-        is not in ``training`` mode, and the adapter ``forward`` methods
-        additionally gate on ``self.training`` as a belt-and-braces check.
-        """
         if not self.training:
+            self.current_timestep_progress = None
             self.current_sigma_r = None
             self.current_sigma_mask = None
+            self._rank_mask_cache = {}
             return
 
         timestep = None
@@ -664,21 +643,51 @@ class TLoRANetwork(torch.nn.Module):
             timestep = kwargs["timesteps"]
 
         if timestep is None:
+            self.current_timestep_progress = None
+            self.current_sigma_r = None
+            self.current_sigma_mask = None
+            self._rank_mask_cache = {}
             return
 
-        if isinstance(timestep, torch.Tensor):
-            t = timestep.flatten()[0] if timestep.dim() > 0 else timestep
-            t = t.item()
-        else:
-            t = timestep
-        r = int(((self.tlora_max_timestep - t) / self.tlora_max_timestep) ** self.tlora_alpha_rank_scale
-                * (self.lora_dim - self.tlora_min_rank)) + self.tlora_min_rank
-        r = max(self.tlora_min_rank, min(r, self.lora_dim))
-        self.current_sigma_r = r
-        # current_sigma_mask is kept as a no-op for backward compatibility with
-        # any external code that introspects it; the hot path only uses
-        # current_sigma_r.
-        self.current_sigma_mask = None
+        target_device = None
+        batch_size = None
+        if len(args) >= 1 and isinstance(args[0], torch.Tensor):
+            target_device = args[0].device
+            batch_size = args[0].shape[0]
+
+        self.current_timestep_progress = timestep_progress(
+            timestep,
+            self.tlora_max_timestep,
+            self.tlora_alpha_rank_scale,
+            device=target_device,
+        )
+        self._rank_mask_cache = {}
+        self.current_sigma_mask = self.get_timestep_rank_mask(
+            self.lora_dim,
+            batch_size or self.current_timestep_progress.numel(),
+            target_device or self.current_timestep_progress.device,
+            torch.float32,
+        )
+        self.current_sigma_r = self.current_sigma_mask.sum(dim=1)
+
+    def get_timestep_rank_mask(self, rank, batch_size, device, dtype):
+        if self.current_timestep_progress is None:
+            return None
+
+        device = torch.device(device)
+        key = (int(rank), int(batch_size), device.type, device.index, dtype)
+        mask = self._rank_mask_cache.get(key)
+        if mask is None:
+            mask = build_rank_mask(
+                self.current_timestep_progress,
+                rank,
+                self.tlora_min_rank,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+            )
+            self._rank_mask_cache[key] = mask
+        return mask
 
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
@@ -719,9 +728,12 @@ class TLoRANetwork(torch.nn.Module):
             logger.info("registered T-LoRA timestep hook on Anima DiT")
 
     def is_mergeable(self):
-        return True
+        return False
 
     def merge_to(self, text_encoders, unet, weights_sd, dtype=None, device=None):
+        raise NotImplementedError("T-LoRA weights must remain as a runtime adapter and cannot be statically merged")
+
+    def _legacy_merge_to(self, text_encoders, unet, weights_sd, dtype=None, device=None):
         apply_text_encoder = apply_unet = False
         for key in weights_sd.keys():
             if key.startswith(TLoRANetwork.LORA_PREFIX_TEXT_ENCODER):
