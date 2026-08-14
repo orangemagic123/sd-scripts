@@ -1,4 +1,4 @@
-name: Apply reviewed training fixes v2
+name: Remove temporary review automation
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  apply:
+  cleanup:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
@@ -18,37 +18,14 @@ jobs:
           ref: codex/fix-training-regressions-20260814
           fetch-depth: 0
 
-      - name: Apply and validate fixes
+      - name: Remove temporary files and commit
         shell: bash
         run: |
-          cat .github/review-patch/part1.txt \
-              .github/review-patch/part2.txt \
-              .github/review-patch/part3.txt \
-              .github/review-patch/part4.txt > /tmp/apply_review_fixes.b64
-          test "$(wc -c < /tmp/apply_review_fixes.b64)" -eq 10384
-          echo '38fee069276a4c2d3c7091a5a06daa5b752750a66e95039dde3319c15f146ff2  /tmp/apply_review_fixes.b64' | sha256sum -c -
-          base64 --decode /tmp/apply_review_fixes.b64 | gzip --decompress > /tmp/apply_review_fixes.py
-          echo 'bf37a92aa17b25f44e5df8e52670e7de8098de9117b97051cff152be0bd206d0  /tmp/apply_review_fixes.py' | sha256sum -c -
-          python /tmp/apply_review_fixes.py
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('networks/lora_tlora_anima.py')
-          text = path.read_text(encoding='utf-8')
-          helper_start = text.index('    def get_timestep_rank_mask')
-          helper_end = text.index('        return mask\n', helper_start) + len('        return mask\n')
-          next_method = text.index('    def set_multiplier', helper_end)
-          text = text[:helper_end] + '\n' + text[next_method:]
-          path.write_text(text, encoding='utf-8')
-          PY
-          python -m compileall -q train_network.py networks/lora_tlora.py networks/lora_tlora_anima.py networks/tlora_utils.py tests/test_tlora_regressions.py tests/test_network_training_regressions.py
-          git diff --check
-
-      - name: Commit generated changes
-        shell: bash
-        run: |
+          rm -rf .github/review-patch
+          rm -f .github/workflows/apply-review-fixes.yml
+          rm -f .github/workflows/apply-review-fixes-v2.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- train_network.py networks/lora_tlora.py networks/lora_tlora_anima.py networks/tlora_utils.py tests/test_tlora_regressions.py tests/test_network_training_regressions.py
-          git commit -m 'Fix T-LoRA batch masking and training regressions'
+          git add -A
+          git commit -m 'Remove temporary review automation'
           git push origin HEAD:codex/fix-training-regressions-20260814
