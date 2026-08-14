@@ -1450,7 +1450,9 @@ class NetworkTrainer:
 
         accelerator.unwrap_model(network).prepare_grad_etc(text_encoder, unet)
 
-        if not cache_latents:  # キャッシュしない場合はVAEを使うのでVAEを準備する
+        if dataset_util.should_keep_vae_for_training(
+            cache_latents, getattr(args, "train_inpainting", False)
+        ):
             vae.requires_grad_(False)
             vae.eval()
             vae.to(accelerator.device, dtype=vae_dtype)

@@ -838,14 +838,6 @@ def verify_training_args(args: argparse.Namespace):
             "cache_latents_to_disk is enabled, so cache_latents is also enabled / cache_latents_to_diskが有効なため、cache_latentsを有効にします"
         )
 
-    if getattr(args, "train_inpainting", False) and getattr(args, "cache_latents", False):
-        raise ValueError(
-            "train_inpainting and cache_latents cannot be used together. "
-            "Inpainting masks are generated randomly per step from the original image, "
-            "so the image must be read on every step. "
-            "Disable cache_latents (and cache_latents_to_disk) when using --train_inpainting."
-        )
-
     # noise_offset, perlin_noise, multires_noise_iterations cannot be enabled at the same time
     # # Listを使って数えてもいいけど並べてしまえ
     # if args.noise_offset is not None and args.multires_noise_iterations is not None:

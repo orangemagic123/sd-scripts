@@ -340,7 +340,9 @@ def train(args):
 
         accelerator.wait_for_everyone()
 
-    if not cache_latents:
+    if dataset_util.should_keep_vae_for_training(
+        cache_latents, getattr(args, "train_inpainting", False)
+    ):
         vae.requires_grad_(False)
         vae.eval()
         vae.to(accelerator.device, dtype=vae_dtype)

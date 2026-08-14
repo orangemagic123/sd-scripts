@@ -1,5 +1,6 @@
-﻿# Anima Strategy Classes
+# Anima Strategy Classes
 
+import hashlib
 import os
 import random
 from typing import Any, List, Optional, Tuple, Union
@@ -157,6 +158,11 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
     """
 
     ANIMA_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX = "_anima_te.npz"
+    CACHE_VERSION = 2
+
+    @staticmethod
+    def _caption_hash(caption: str) -> str:
+        return hashlib.sha256(caption.encode("utf-8")).hexdigest()
 
     def __init__(
         self,
@@ -175,38 +181,52 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return os.path.splitext(image_abs_path)[0] + f"_anima_te_v{variant_idx}.npz"
 
     def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
-        if not self.cache_to_disk:
-            return False
-        if not os.path.exists(npz_path):
+        if not self.cache_to_disk or not os.path.exists(npz_path):
             return False
         if self.skip_disk_cache_validity_check:
             return True
 
         try:
-            npz = np.load(npz_path)
-            if "prompt_embeds" not in npz:
-                return False
-            if "attn_mask" not in npz:
-                return False
-            if "t5_input_ids" not in npz:
-                return False
-            if "t5_attn_mask" not in npz:
-                return False
-            if "caption_dropout_rate" not in npz:
-                return False
-        except Exception as e:
-            logger.error(f"Error loading file: {npz_path}")
-            raise e
+            with np.load(npz_path) as data:
+                required_keys = (
+                    "prompt_embeds",
+                    "attn_mask",
+                    "t5_input_ids",
+                    "t5_attn_mask",
+                    "caption_dropout_rate",
+                    "cache_version",
+                    "caption_sha256",
+                )
+                return all(key in data for key in required_keys) and (
+                    int(data["cache_version"].item()) == self.CACHE_VERSION
+                )
+        except Exception:
+            return False
 
-        return True
+    def is_disk_cached_outputs_expected_for_caption(
+        self, npz_path: str, caption: str
+    ) -> bool:
+        if not self.is_disk_cached_outputs_expected(npz_path):
+            return False
+        if self.skip_disk_cache_validity_check:
+            return True
+        try:
+            with np.load(npz_path) as data:
+                return str(data["caption_sha256"].item()) == self._caption_hash(
+                    caption
+                )
+        except Exception:
+            return False
 
     def load_outputs_npz(self, npz_path: str) -> List[np.ndarray]:
-        data = np.load(npz_path)
-        prompt_embeds = data["prompt_embeds"]
-        attn_mask = data["attn_mask"]
-        t5_input_ids = data["t5_input_ids"]
-        t5_attn_mask = data["t5_attn_mask"]
-        caption_dropout_rate = data["caption_dropout_rate"]
+        with np.load(npz_path) as data:
+            prompt_embeds = np.array(data["prompt_embeds"], copy=True)
+            attn_mask = np.array(data["attn_mask"], copy=True)
+            t5_input_ids = np.array(data["t5_input_ids"], copy=True)
+            t5_attn_mask = np.array(data["t5_attn_mask"], copy=True)
+            caption_dropout_rate = np.array(
+                data["caption_dropout_rate"], copy=True
+            )
         return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, caption_dropout_rate]
 
     def cache_batch_outputs(
@@ -255,6 +275,8 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                     t5_input_ids=t5_input_ids_i,
                     t5_attn_mask=t5_attn_mask_i,
                     caption_dropout_rate=caption_dropout_rate,
+                    cache_version=np.asarray(self.CACHE_VERSION, dtype=np.int32),
+                    caption_sha256=np.asarray(self._caption_hash(captions[i])),
                 )
             else:
                 info.text_encoder_outputs = (prompt_embeds_i, attn_mask_i, t5_input_ids_i, t5_attn_mask_i, caption_dropout_rate)

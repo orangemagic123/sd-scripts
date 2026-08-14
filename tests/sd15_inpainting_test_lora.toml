@@ -15,9 +15,10 @@ mixed_precision = "fp16"
 gradient_checkpointing = true
 sdpa = true
 max_data_loader_n_workers = 0
-# cache_latents is incompatible with train_inpainting (see ft TOML for details).
-cache_latents = false
-cache_latents_to_disk = false
+# Cache the original latents while regenerating the random inpainting
+# mask and masked-image pixels on every training step.
+cache_latents = true
+cache_latents_to_disk = true
 
 # --- bucketing ---
 enable_bucket = true

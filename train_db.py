@@ -187,9 +187,14 @@ def train(args):
         unet.enable_gradient_checkpointing()
         text_encoder.gradient_checkpointing_enable()
 
-    if not cache_latents:
+    if dataset_util.should_keep_vae_for_training(
+        cache_latents, getattr(args, "train_inpainting", False)
+    ):
         vae.requires_grad_(False)
         vae.eval()
+        # train_db encodes images outside autocast after casting them to
+        # weight_dtype, so preserve the entrypoint's existing VAE/input dtype
+        # contract even when no_half_vae is requested.
         vae.to(accelerator.device, dtype=weight_dtype)
 
     # 学習に必要なクラスを準備する
