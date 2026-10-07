@@ -716,6 +716,17 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
         " / --show_timesteps が解像度依存サンプリング（flux_shift等）で想定する画像解像度（ピクセル）。"
         "カンマ区切りで、数値が1つならH/W両方に、2つならH,Wに使用（W,Hでも結果は同じ）。デフォルト: 1024。",
     )
+    parser.add_argument(
+        "--show_timesteps_offset",
+        type=float,
+        default=0.0,
+        help="timestep sampling offset applied by --show_timesteps, to preview the distribution for a subset with "
+        "custom_attributes.timestep_sampling.offset (see docs/timestep_sampling_offset.md). "
+        "Only effective for timestep_sampling sigmoid/shift/flux_shift. Default: 0.0. "
+        " / --show_timesteps でタイムステップ分布に適用するオフセット。custom_attributes.timestep_sampling.offset を"
+        "指定した subset の分布を事前確認するために使用（docs/timestep_sampling_offset.md 参照）。"
+        "timestep_sampling が sigmoid/shift/flux_shift の場合のみ有効。デフォルト: 0.0。",
+    )
 
     # offloading
     parser.add_argument(
@@ -837,6 +848,12 @@ def verify_training_args(args: argparse.Namespace):
         logger.warning(
             "cache_latents_to_disk is enabled, so cache_latents is also enabled / cache_latents_to_diskが有効なため、cache_latentsを有効にします"
         )
+
+    if getattr(args, "sample_prompts", None) and getattr(args, "sample_sampler", None):
+        # e.g. lms needs scipy: fail here rather than at the first sample generation after loading the models
+        from library.sampling import check_sampler_requirements
+
+        check_sampler_requirements(args.sample_sampler)
 
     # noise_offset, perlin_noise, multires_noise_iterations cannot be enabled at the same time
     # # Listを使って数えてもいいけど並べてしまえ
