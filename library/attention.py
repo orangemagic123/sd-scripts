@@ -153,9 +153,12 @@ def attention(
             attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, True)  # do not in-place modify
             attn_params.seqlens = torch.tensor([q.shape[1]] * q.shape[0], device=q.device)
             attn_params.max_seqlen = q.shape[1]
-        q = [transpose_fn(q[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(q))]
-        k = [transpose_fn(k[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(k))]
-        v = [transpose_fn(v[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(v))]
+        # Do not capture q/k/v in the comprehension's closure: on Python 3.10,
+        # deleting those cells below emits DELETE_DEREF, which Dynamo cannot trace
+        # even when split_attn=False and this branch is not executed.
+        q = [transpose_fn(qi[None, : attn_params.seqlens[i]]) for i, qi in enumerate(q)]
+        k = [transpose_fn(ki[None, : attn_params.seqlens[i]]) for i, ki in enumerate(k)]
+        v = [transpose_fn(vi[None, : attn_params.seqlens[i]]) for i, vi in enumerate(v)]
     else:
         q = transpose_fn(q)
         k = transpose_fn(k)

@@ -36,6 +36,13 @@ Note: `torch.compile` may not work well in every environment. If it fails, simpl
 
 These arguments are added by `anima_train_network.py`. They are independent of the legacy `--torch_compile` option (which routes through accelerate's dynamo and is not the per-block path described here). **`--compile` and `--torch_compile` cannot be used together.**
 
+For Anima training, prefer `--compile`. The two names are not aliases: the legacy
+path compiles the model through Accelerate, while `--compile` keeps separate
+compiled regions for the DiT blocks. Both paths retain gradient checkpointing
+when enabled, but their backward graphs and peak memory usage can differ.
+An OOM inside a compiled backward pass does not, by itself, mean that the same
+resolution or network configuration cannot fit with per-block compilation.
+
 ### Basic arguments / 基本的な引数
 
 - `--compile`: Enable per-block `torch.compile` for the DiT (requires Triton).
@@ -198,6 +205,13 @@ The performance gain depends on the GPU, settings, and dataset. As one example, 
 ## 8. Troubleshooting / トラブルシューティング
 
 - **Out of memory.** Try a smaller `--compile_cache_size_limit`, reduce batch size, or use `--compile_mode default` instead of `max-autotune`.
+- **Out of memory with legacy `--torch_compile`.** First compare with `--compile`
+  (remove `--torch_compile`, or set `torch_compile = false` in TOML), keeping the
+  dataset, network, batch size and gradient checkpointing unchanged. Check several
+  steps and bucket shapes. Whole-model and per-block compilation can have different
+  backward memory peaks; disabling checkpointing is not a remedy. If reporting the
+  issue, include PyTorch, Accelerate, Triton and network-package versions and the
+  peak allocated memory for each path.
 - **Compilation errors.** Ensure Triton is installed correctly. On Windows with `--compile_dynamic true`, verify the MSVC setup (Section 6). If problems persist, train without `--compile`.
 
 <details>
