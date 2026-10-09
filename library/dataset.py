@@ -77,6 +77,21 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 
+def _log_dataset_epoch_info(message: str, logged_messages: Optional[set[str]] = None):
+    # Each DataLoader worker has its own dataset copy. Let only worker 0
+    # report epoch information, and deduplicate it across datasets in a group.
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is not None and worker_info.id != 0:
+        return
+    if os.environ.get("RANK", "0") != "0":
+        return
+    if logged_messages is not None:
+        if message in logged_messages:
+            return
+        logged_messages.add(message)
+    logger.info(message)
+
+
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
 
 try:
@@ -501,14 +516,17 @@ class BaseDataset(torch.utils.data.Dataset):
     def set_seed(self, seed):
         self.seed = seed
 
-    def set_current_epoch(self, epoch):
+    def set_current_epoch(self, epoch, *, logged_messages: Optional[set[str]] = None):
         if not self.current_epoch == epoch:  # epochが切り替わったらバケツをシャッフルする
             if epoch > self.current_epoch:
-                logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
+                _log_dataset_epoch_info(
+                    "epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch),
+                    logged_messages,
+                )
                 # Worker processes can be initialized at a later epoch. Replaying
                 # every intermediate epoch is noisy and performs needless shuffles.
                 self.current_epoch = epoch
-                self.log_protected_tags(self.current_epoch)
+                self.log_protected_tags(self.current_epoch, logged_messages=logged_messages)
                 self.shuffle_buckets()
                 # self.current_epoch seem to be set to 0 again in the next epoch. it may be caused by skipped_dataloader?
             else:
@@ -561,14 +579,17 @@ class BaseDataset(torch.utils.data.Dataset):
         self.protected_tags_cache[subset.protected_tags_file] = protected_tags
         return protected_tags
 
-    def log_protected_tags(self, epoch: int):
+    def log_protected_tags(self, epoch: int, *, logged_messages: Optional[set[str]] = None):
         logged_files = set()
         for subset in self.subsets:
             if not subset.protected_tags_file or subset.protected_tags_file in logged_files:
                 continue
             logged_files.add(subset.protected_tags_file)
             protected_tags = sorted(self._get_protected_tags(subset))
-            logger.info(f"[protected tags] epoch={epoch} file={subset.protected_tags_file} tags={protected_tags}")
+            _log_dataset_epoch_info(
+                f"[protected tags] epoch={epoch} file={subset.protected_tags_file} tags={protected_tags}",
+                logged_messages,
+            )
 
     def _process_tag_caption(self, subset: BaseSubset, caption: str):
         dropped_tags = []
@@ -1764,8 +1785,9 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             dataset.set_current_strategies()
 
     def set_current_epoch(self, epoch):
+        logged_messages = set()
         for dataset in self.datasets:
-            dataset.set_current_epoch(epoch)
+            dataset.set_current_epoch(epoch, logged_messages=logged_messages)
 
     def set_current_step(self, step):
         for dataset in self.datasets:
