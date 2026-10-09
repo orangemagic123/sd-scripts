@@ -165,8 +165,8 @@ class ControlNetDataset(BaseDataset):
     def set_current_strategies(self):
         return self.dreambooth_dataset_delegate.set_current_strategies()
 
-    def set_current_epoch(self, epoch):
-        return self.dreambooth_dataset_delegate.set_current_epoch(epoch)
+    def set_current_epoch(self, epoch, *, logged_messages: Optional[set[str]] = None):
+        return self.dreambooth_dataset_delegate.set_current_epoch(epoch, logged_messages=logged_messages)
 
     def set_current_step(self, step):
         return self.dreambooth_dataset_delegate.set_current_step(step)
