@@ -471,6 +471,37 @@ def get_dummy_scheduler(optimizer: Optimizer) -> Any:
 # Add some checking and features to the original function.
 
 
+def get_piecewise_constant_schedule_with_warmup(
+    optimizer: Optimizer, step_rules: str, num_warmup_steps: int = 0, last_epoch: int = -1
+):
+    """Apply linear warmup to piecewise LR multipliers, keeping rule boundaries absolute."""
+    if num_warmup_steps < 0:
+        raise ValueError("num_warmup_steps must be non-negative")
+    if num_warmup_steps == 0:
+        schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[DiffusersSchedulerType.PIECEWISE_CONSTANT]
+        return schedule_func(optimizer, step_rules=step_rules, last_epoch=last_epoch)
+
+    rule_list = step_rules.split(",")
+    rules = {}
+    for rule in rule_list[:-1]:
+        multiplier, boundary = rule.split(":")
+        rules[int(boundary)] = float(multiplier)
+    sorted_rules = sorted(rules.items())
+    final_multiplier = float(rule_list[-1])
+
+    def lr_lambda(current_step):
+        multiplier = final_multiplier
+        for boundary, rule_multiplier in sorted_rules:
+            if current_step < boundary:
+                multiplier = rule_multiplier
+                break
+        if current_step < num_warmup_steps:
+            multiplier *= float(current_step) / num_warmup_steps
+        return multiplier
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
+
+
 def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     """
     Unified API to get any scheduler from its name.
@@ -528,9 +559,9 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
 
     if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
-        name = DiffusersSchedulerType(name)
-        schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
-        return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
+        return get_piecewise_constant_schedule_with_warmup(
+            optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs
+        )  # step_rules and last_epoch are given as kwargs
 
     name = SchedulerType(name)
     schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
