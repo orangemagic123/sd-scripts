@@ -84,6 +84,22 @@ Options match `train_network.py`:
 *   `--fused_backward_pass`: **Experimental**: Fuses gradient calculation and optimizer steps to reduce VRAM usage. Available for SDXL. Currently only supports `Adafactor` optimizer. Cannot be used with Gradient Accumulation.
 *   `--resume=\"<state directory>\"`: Resumes training from a saved state (saved with `--save_state`). Restores optimizer state, step count, etc.
 
+#### Piecewise Constant Learning Rate with Warmup
+
+`piecewise_constant` keeps the LR constant within each interval and optionally applies linear warmup via `--lr_warmup_steps`. For a single-GPU run of 10,000 optimizer updates, the following TOML settings warm up for 100 steps, hold the LR at `2e-5` until step 5,000, and then hold it at `1e-5`:
+
+```toml
+learning_rate = 2e-5
+unet_lr = 2e-5
+lr_scheduler = "piecewise_constant"
+lr_scheduler_args = ["step_rules='1:5000,0.5'"]
+lr_warmup_steps = 100
+```
+
+Each `multiplier:boundary` rule applies until that absolute scheduler step, and the final multiplier applies thereafter. Boundaries count from the start of training, including warmup; they are not interval lengths or percentages. During warmup, the current piecewise multiplier is additionally multiplied by `step / warmup_steps`. `lr_warmup_steps = 0` preserves the original schedule, while a fractional value such as `0.01` uses the existing ratio-of-total-steps behavior.
+
+On a single GPU, gradient accumulation does not multiply these step counts. With the standard Accelerate multi-process setup (without split batches), the scheduler advances once per process for each optimizer update, so multiply the rule boundaries by the process count. Integer warmup values also use scheduler steps; fractional warmup values already account for the process count.
+
 ### 1.6. Caching
 
 Caching is effective for SDXL due to its high computational cost.
