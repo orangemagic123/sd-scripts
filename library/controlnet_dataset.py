@@ -89,6 +89,8 @@ class ControlNetDataset(BaseDataset):
                 subset.token_warmup_min,
                 subset.token_warmup_step,
                 resize_interpolation=subset.resize_interpolation,
+                enable_multiline_caption=subset.enable_multiline_caption,
+                multiline_caption_separator=subset.multiline_caption_separator,
             )
             db_subsets.append(db_subset)
 
@@ -114,6 +116,7 @@ class ControlNetDataset(BaseDataset):
 
         # config_util等から参照される値をいれておく（若干微妙なのでなんとかしたい）
         self.image_data = self.dreambooth_dataset_delegate.image_data
+        self.has_multiple_caption_candidates = self.dreambooth_dataset_delegate.has_multiple_caption_candidates
         self.batch_size = batch_size
         self.num_train_images = self.dreambooth_dataset_delegate.num_train_images
         self.num_reg_images = self.dreambooth_dataset_delegate.num_reg_images
@@ -182,8 +185,13 @@ class ControlNetDataset(BaseDataset):
         self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager
         self.buckets_indices = self.dreambooth_dataset_delegate.buckets_indices
 
-    def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False):
-        return self.dreambooth_dataset_delegate.is_text_encoder_output_cacheable(cache_supports_dropout)
+    def is_text_encoder_output_cacheable(
+        self, cache_supports_dropout: bool = False, supports_multiple_caption_candidates: bool = False
+    ):
+        return self.dreambooth_dataset_delegate.is_text_encoder_output_cacheable(
+            cache_supports_dropout=cache_supports_dropout,
+            supports_multiple_caption_candidates=supports_multiple_caption_candidates,
+        )
 
     def new_cache_latents(self, model: Any, accelerator: Accelerator):
         return self.dreambooth_dataset_delegate.new_cache_latents(model, accelerator)

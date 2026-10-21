@@ -50,7 +50,6 @@ class Krea2TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
     CACHE_VERSION = 2
     EXPECTED_TEXT_LAYERS = 12
     EXPECTED_TEXT_DIM = 2560
-    requires_processed_captions = True
 
     def __init__(
         self,

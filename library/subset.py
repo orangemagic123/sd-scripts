@@ -9,6 +9,8 @@ sampling settings applied to it.
 import logging
 from typing import Any, Dict, Optional, Tuple, Union
 
+DEFAULT_MULTILINE_CAPTION_SEPARATOR = "---===---"
+
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,8 @@ class BaseSubset:
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        enable_multiline_caption: bool = False,
+        multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -62,6 +66,12 @@ class BaseSubset:
         self.keep_tokens_separator = keep_tokens_separator
         self.secondary_separator = secondary_separator
         self.enable_wildcard = enable_wildcard
+        self.enable_multiline_caption = enable_multiline_caption
+        if enable_multiline_caption:
+            assert (
+                multiline_caption_separator
+            ), "multiline_caption_separator must not be empty / multiline_caption_separatorは空にできません"
+        self.multiline_caption_separator = multiline_caption_separator
         self.color_aug = color_aug
         self.flip_aug = flip_aug
         self.face_crop_aug_range = face_crop_aug_range
@@ -133,6 +143,8 @@ class DreamBoothSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        enable_multiline_caption: bool = False,
+        multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -165,6 +177,8 @@ class DreamBoothSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            enable_multiline_caption=enable_multiline_caption,
+            multiline_caption_separator=multiline_caption_separator,
         )
 
         self.is_reg = is_reg
@@ -212,6 +226,8 @@ class FineTuningSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        enable_multiline_caption: bool = False,
+        multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -244,6 +260,8 @@ class FineTuningSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            enable_multiline_caption=enable_multiline_caption,
+            multiline_caption_separator=multiline_caption_separator,
         )
 
         self.metadata_file = metadata_file
@@ -287,6 +305,8 @@ class ControlNetSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        enable_multiline_caption: bool = False,
+        multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -319,6 +339,8 @@ class ControlNetSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            enable_multiline_caption=enable_multiline_caption,
+            multiline_caption_separator=multiline_caption_separator,
         )
 
         self.conditioning_data_dir = conditioning_data_dir

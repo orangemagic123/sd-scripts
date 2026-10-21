@@ -190,6 +190,98 @@ def split_train_val(
         return paths[split:], sizes[split:]
 
 
+def normalize_multiline_caption(caption: str) -> str:
+    """Normalize a multi-line caption: strip trailing whitespace of each line and remove leading/trailing blank lines.
+
+    Leading whitespace of each line and blank lines in the middle are kept, because they may be intentional
+    (indentation, paragraph breaks).
+    """
+    lines = [line.rstrip() for line in caption.split("\n")]
+    while lines and lines[0] == "":
+        lines.pop(0)
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
+def split_caption_candidates(caption: str, separator: str) -> List[str]:
+    """Split a multi-line caption into candidates by separator lines.
+
+    A line whose stripped content starts with ``separator`` is a separator line. Text after ``#`` on a separator line
+    is a comment. Any other non-blank text between the separator and the comment is reserved for future extensions
+    (e.g. sampling weights) and raises ``ValueError``.
+
+    Each candidate is normalized with :func:`normalize_multiline_caption`; empty candidates are dropped.
+    Returns ``[""]`` if no candidate remains.
+    """
+    assert separator, "separator must not be empty"
+
+    candidates: List[str] = []
+    current: List[str] = []
+    for line in caption.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(separator):
+            reserved = stripped[len(separator) :].split("#", 1)[0].strip()
+            if reserved:
+                raise ValueError(
+                    f"unsupported text after caption candidate separator (only `#` comments are allowed)"
+                    + f" / キャプション候補の区切り行の後ろに未対応の文字列があります（`#` によるコメントのみ指定可能です）: {line!r}"
+                )
+            candidates.append("\n".join(current))
+            current = []
+        else:
+            current.append(line)
+    candidates.append("\n".join(current))
+
+    candidates = [normalize_multiline_caption(c) for c in candidates]
+    candidates = [c for c in candidates if c != ""]
+    return candidates if candidates else [""]
+
+
+def add_caption_prefix_suffix(subset: BaseSubset, caption: str) -> str:
+    """Add ``caption_prefix`` / ``caption_suffix`` of the subset to the caption."""
+    if subset.caption_prefix:
+        caption = subset.caption_prefix + " " + caption
+    if subset.caption_suffix:
+        caption = caption + " " + subset.caption_suffix
+    return caption
+
+
+def apply_caption_replacements(subset: BaseSubset, caption: str, replacements: Dict[str, Any]) -> str:
+    """Replace ``secondary_separator`` with ``caption_separator`` and apply the (Textual Inversion) replacements."""
+    if subset.secondary_separator:
+        caption = caption.replace(subset.secondary_separator, subset.caption_separator)
+
+    for str_from, str_to in replacements.items():
+        if str_from == "":
+            # replace all
+            if type(str_to) == list:
+                caption = random.choice(str_to)
+            else:
+                caption = str_to
+        else:
+            caption = caption.replace(str_from, str_to)
+    return caption
+
+
+def strip_keep_tokens_separator(subset: BaseSubset, caption: str) -> str:
+    """Remove ``keep_tokens_separator`` from the caption. The separator is control syntax and must never reach the
+    text encoder. Lines containing it are re-joined with ``caption_separator`` + space, other lines are kept as is."""
+    separator = getattr(subset, "keep_tokens_separator", None)
+    if not separator or separator not in caption:
+        return caption
+
+    lines = []
+    for line in caption.split("\n"):
+        if separator in line:
+            all_tokens = []
+            for part in line.split(separator):
+                all_tokens.extend(token.strip() for token in part.split(subset.caption_separator) if token.strip())
+            line = f"{subset.caption_separator} ".join(all_tokens)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 class ImageInfo:
     def __init__(
         self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, caption_dropout_rate: float = 0.0
@@ -471,6 +563,10 @@ class BaseDataset(torch.utils.data.Dataset):
         self.image_data: Dict[str, ImageInfo] = {}
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
 
+        # True if any image has multiple caption candidates (enable_multiline_caption with separator lines).
+        # Text encoder outputs cannot be cached in that case because one candidate is chosen randomly at each step.
+        self.has_multiple_caption_candidates = False
+
         self.replacements = {}
         self.protected_tags_cache: Dict[str, set[str]] = {}
         self.log_captions_every_n_steps = 0
@@ -564,8 +660,48 @@ class BaseDataset(torch.utils.data.Dataset):
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
 
+    def validate_caption_candidates(self, subset: BaseSubset, captions: Sequence[str]):
+        """Validate separator lines of multi-line captions at loading time and record whether any image has
+        multiple candidates. Does nothing if ``enable_multiline_caption`` is disabled."""
+        if not subset.enable_multiline_caption:
+            return
+        for caption in captions:
+            candidates = split_caption_candidates(caption, subset.multiline_caption_separator)  # raises ValueError if invalid
+            if len(candidates) > 1:
+                self.has_multiple_caption_candidates = True
+
+    def process_caption_candidates_for_cache(self, subset: BaseSubset, caption: str) -> List[str]:
+        """Deterministic part of :meth:`process_caption` for every caption candidate, used when caching Text Encoder
+        outputs. Returns one or more processed captions (prefix/suffix etc. applied).
+
+        With ``enable_multiline_caption`` all candidates separated by separator lines are returned, otherwise a single
+        caption. The random processing (caption dropout, wildcard replacement, shuffling, tag dropout, token warmup) is
+        not applied, because the cached outputs are shared by all steps. See :meth:`is_text_encoder_output_cacheable`
+        for which of these are rejected or warned. ``keep_tokens_separator`` is removed, same as :meth:`process_caption`.
+        """
+        if subset.enable_multiline_caption:
+            candidates = split_caption_candidates(caption, subset.multiline_caption_separator)
+        elif subset.enable_wildcard:
+            # lines and wildcard notations are kept as they are (warned in is_text_encoder_output_cacheable)
+            candidates = [caption]
+        else:
+            # if caption is multiline, use the first line
+            candidates = [caption.split("\n")[0]]
+
+        return [
+            apply_caption_replacements(
+                subset, strip_keep_tokens_separator(subset, add_caption_prefix_suffix(subset, candidate)), self.replacements
+            )
+            for candidate in candidates
+        ]
+
+    def process_caption_for_cache(self, subset: BaseSubset, caption: str) -> str:
+        """The first (or only) processed caption candidate of :meth:`process_caption_candidates_for_cache`, for
+        caching strategies without multiple candidate support."""
+        return self.process_caption_candidates_for_cache(subset, caption)[0]
+
     def _get_protected_tags(self, subset: BaseSubset) -> set[str]:
-        if not subset.protected_tags_file:
+        if not getattr(subset, "protected_tags_file", None):
             return set()
         if subset.protected_tags_file in self.protected_tags_cache:
             return self.protected_tags_cache[subset.protected_tags_file]
@@ -671,19 +807,8 @@ class BaseDataset(torch.utils.data.Dataset):
                 fixed_suffix_tokens = drop_fixed_tokens(fixed_suffix_tokens)
 
             caption = f"{subset.caption_separator} ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
-        elif (
-            hasattr(subset, "keep_tokens_separator")
-            and subset.keep_tokens_separator
-            and subset.keep_tokens_separator in caption
-        ):
-            # The separator is control syntax and must never reach the text encoder.
-            parts = caption.split(subset.keep_tokens_separator)
-            all_tokens = []
-            for part in parts:
-                all_tokens.extend(
-                    token.strip() for token in part.split(subset.caption_separator) if token.strip()
-                )
-            caption = f"{subset.caption_separator} ".join(all_tokens)
+        else:
+            caption = strip_keep_tokens_separator(subset, caption)
 
         return caption, dropped_tags, fixed_tokens
 
@@ -693,13 +818,32 @@ class BaseDataset(torch.utils.data.Dataset):
         caption: str,
         caption_nl: Optional[str] = None,
         skip_caption_dropout: bool = False,
-    ):
+    ) -> str:
+        return self.process_caption_with_debug(subset, caption, caption_nl, skip_caption_dropout)[0]
+
+    def process_caption_with_debug(
+        self,
+        subset: BaseSubset,
+        caption: str,
+        caption_nl: Optional[str] = None,
+        skip_caption_dropout: bool = False,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """:meth:`process_caption` that also returns ``{"caption_mode": ..., "dropped_tags": [...]}`` for caption logging."""
         debug_info = {"caption_mode": "tags", "dropped_tags": []}
-        # caption に prefix/suffix を付ける
-        if subset.caption_prefix:
-            caption = subset.caption_prefix + " " + caption
-        if subset.caption_suffix:
-            caption = caption + " " + subset.caption_suffix
+        # select one caption from candidates. this must be done before adding prefix/suffix
+        if subset.enable_multiline_caption:
+            # candidates are separated by separator lines, line breaks in each candidate are kept
+            candidates = split_caption_candidates(caption, subset.multiline_caption_separator)
+            caption = random.choice(candidates) if len(candidates) > 1 else candidates[0]
+        elif subset.enable_wildcard:
+            # if caption is multiline, random choice one line
+            if "\n" in caption:
+                caption = random.choice(caption.split("\n"))
+        else:
+            # if caption is multiline, use the first line
+            caption = caption.split("\n")[0]
+
+        caption = add_caption_prefix_suffix(subset, caption)
 
         # dropoutの決定：tag dropがこのメソッド内にあるのでここで行うのが良い
         if skip_caption_dropout:
@@ -717,10 +861,6 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             # process wildcards
             if subset.enable_wildcard:
-                # if caption is multiline, random choice one line
-                if "\n" in caption:
-                    caption = random.choice(caption.split("\n"))
-
                 # wildcard is like '{aaa|bbb|ccc...}'
                 # escape the curly braces like {{ or }}
                 replacer1 = "⦅"
@@ -739,14 +879,17 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 # unescape the curly braces
                 caption = caption.replace(replacer1, "{").replace(replacer2, "}")
-            else:
-                # if caption is multiline, use the first line
-                caption = caption.split("\n")[0]
 
-            tag_caption, dropped_tags, processed_fixed_tokens = self._process_tag_caption(subset, caption)
+            # shuffle / tag dropout / token warmup are applied only to single-line captions:
+            # with enable_multiline_caption, a caption containing line breaks is used as is
+            is_single_line = not subset.enable_multiline_caption or "\n" not in caption
+            if is_single_line:
+                tag_caption, dropped_tags, processed_fixed_tokens = self._process_tag_caption(subset, caption)
+            else:
+                tag_caption, dropped_tags, processed_fixed_tokens = strip_keep_tokens_separator(subset, caption), [], []
             selected_mode = "tags"
 
-            if subset.caption_mode == "mixed" and caption_nl:
+            if getattr(subset, "caption_mode", "tags") == "mixed" and caption_nl:
                 nl_caption = caption_nl.split("\n")[0] if "\n" in caption_nl else caption_nl
                 special_dropout_rate = getattr(subset, "special_caption_tag_dropout_rate", 0.0) or 0.0
                 if special_dropout_rate > 0:
@@ -789,20 +932,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 caption = tag_caption
             debug_info["dropped_tags"] = dropped_tags
 
-            # process secondary separator
-            if subset.secondary_separator:
-                caption = caption.replace(subset.secondary_separator, subset.caption_separator)
-
-            # textual inversion対応
-            for str_from, str_to in self.replacements.items():
-                if str_from == "":
-                    # replace all
-                    if type(str_to) == list:
-                        caption = random.choice(str_to)
-                    else:
-                        caption = str_to
-                else:
-                    caption = caption.replace(str_from, str_to)
+            caption = apply_caption_replacements(subset, caption, self.replacements)
 
         return caption, debug_info
 
@@ -922,7 +1052,28 @@ class BaseDataset(torch.utils.data.Dataset):
     def is_latent_cacheable(self):
         return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
 
-    def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False):
+    def is_text_encoder_output_cacheable(
+        self, cache_supports_dropout: bool = False, supports_multiple_caption_candidates: bool = False
+    ):
+        """``supports_multiple_caption_candidates`` is True if the caching strategy of the trainer caches the outputs of
+        all caption candidates (``TextEncoderOutputsCachingStrategy.supports_multiple_caption_candidates``). It is passed
+        as a flag because this is called before the strategy is set."""
+        if self.has_multiple_caption_candidates:
+            if not supports_multiple_caption_candidates:
+                logger.error(
+                    "Text Encoder outputs cannot be cached because some captions have multiple candidates (enable_multiline_caption with separator lines): one candidate is chosen randomly at each step"
+                    + " / 複数のキャプション候補を持つ画像があるため（enable_multiline_caption と区切り行）、Text Encoder の出力をキャッシュできません。候補はステップごとにランダムに選ばれます"
+                )
+                return False
+            logger.info(
+                "some captions have multiple candidates: the Text Encoder outputs of all candidates are cached, one of them is chosen randomly at each step"
+                + " / 複数のキャプション候補を持つ画像があります。全候補の Text Encoder 出力をキャッシュし、ステップごとにランダムに選びます"
+            )
+        if any(subset.enable_wildcard for subset in self.subsets):
+            logger.warning(
+                "enable_wildcard has no effect when caching Text Encoder outputs: the caption is encoded as is (all lines joined, `{a|b}` not replaced)"
+                + " / Text Encoder の出力をキャッシュする場合、enable_wildcard は効きません。キャプションはそのまま（全行を連結し、`{a|b}` も置換せずに）エンコードされます"
+            )
         return all(
             [
                 not (
@@ -932,7 +1083,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     or subset.token_warmup_step > 0
                     or subset.caption_tag_dropout_rate > 0
                     or getattr(subset, "special_caption_tag_dropout_rate", 0.0) > 0
-                    or subset.caption_mode == "mixed"
+                    or getattr(subset, "caption_mode", "tags") == "mixed"
                 )
                 for subset in self.subsets
             ]
@@ -1053,15 +1204,22 @@ class BaseDataset(torch.utils.data.Dataset):
         text_encoding_strategy = TextEncodingStrategy.get_strategy()
         caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
         batch_size = caching_strategy.batch_size or self.batch_size
-        requires_processed_captions = getattr(caching_strategy, "requires_processed_captions", False)
-        processed_captions = {}
 
         logger.info("caching Text Encoder outputs with caching strategy.")
         image_infos = list(self.image_data.values())
 
+        multi_candidates = caching_strategy.supports_multiple_caption_candidates
+        if self.has_multiple_caption_candidates and not multi_candidates:
+            # trainers check this in is_text_encoder_output_cacheable, but tools/cache_text_encoder_outputs.py does not
+            raise ValueError(
+                "Text Encoder outputs cannot be cached because some captions have multiple candidates (enable_multiline_caption with separator lines) and this model does not support caching multiple candidates"
+                + " / 複数のキャプション候補を持つ画像があり（enable_multiline_caption と区切り行）、このモデルは複数候補のキャッシュに対応していないため、Text Encoder の出力をキャッシュできません"
+            )
+
         # split by resolution
         batches = []
         batch = []
+        batch_num_captions = 0  # number of caption candidates in the batch (an image may have multiple candidates)
 
         # support multiple-gpus
         num_processes = accelerator.num_processes
@@ -1069,6 +1227,9 @@ class BaseDataset(torch.utils.data.Dataset):
 
         logger.info("checking cache validity...")
         for i, info in enumerate(tqdm(image_infos)):
+            # apply the deterministic caption processing (prefix/suffix etc.), the random processing is not applicable
+            captions = self.process_caption_candidates_for_cache(self.image_to_subset[info.image_key], info.caption)
+
             # check disk cache exists and size of text encoder outputs
             if caching_strategy.cache_to_disk:
                 te_out_npz = caching_strategy.get_outputs_npz_path(info.absolute_path)
@@ -1079,44 +1240,24 @@ class BaseDataset(torch.utils.data.Dataset):
                 if i % num_processes != process_index:
                     continue
 
-                if requires_processed_captions:
-                    subset = self.image_to_subset[info.image_key]
-                    caption, _ = self.process_caption(
-                        subset,
-                        info.caption,
-                        getattr(info, "caption_nl", None),
-                        skip_caption_dropout=True,
-                    )
-                    processed_captions[info.image_key] = caption
-
-                cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
-                if (
-                    cache_available
-                    and requires_processed_captions
-                    and hasattr(caching_strategy, "is_disk_cached_outputs_expected_for_caption")
-                ):
-                    cache_available = caching_strategy.is_disk_cached_outputs_expected_for_caption(
-                        te_out_npz, processed_captions[info.image_key]
-                    )
+                if multi_candidates:
+                    cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz, captions)
+                else:
+                    cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
+                    if cache_available and hasattr(caching_strategy, "is_disk_cached_outputs_expected_for_caption"):
+                        # the cache records the encoded caption: re-cache if the caption has been changed
+                        cache_available = caching_strategy.is_disk_cached_outputs_expected_for_caption(te_out_npz, captions[0])
                 if cache_available:  # do not add to batch
                     continue
 
-            elif requires_processed_captions:
-                subset = self.image_to_subset[info.image_key]
-                caption, _ = self.process_caption(
-                    subset,
-                    info.caption,
-                    getattr(info, "caption_nl", None),
-                    skip_caption_dropout=True,
-                )
-                processed_captions[info.image_key] = caption
+            batch.append((info, captions))
+            batch_num_captions += len(captions)
 
-            batch.append(info)
-
-            # if number of data in batch is enough, flush the batch
-            if len(batch) >= batch_size:
+            # if number of captions in batch is enough, flush the batch
+            if batch_num_captions >= batch_size:
                 batches.append(batch)
                 batch = []
+                batch_num_captions = 0
 
         if len(batch) > 0:
             batches.append(batch)
@@ -1128,41 +1269,14 @@ class BaseDataset(torch.utils.data.Dataset):
         # iterate batches
         logger.info("caching Text Encoder outputs...")
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
-            if requires_processed_captions:
-                caching_strategy.cache_batch_outputs(
-                    tokenize_strategy,
-                    models,
-                    text_encoding_strategy,
-                    batch,
-                    captions=[processed_captions[info.image_key] for info in batch],
-                )
-                continue
-
-            # keep_tokens_separator is control syntax, not caption content.
-            original_captions = {}
-            for info in batch:
-                subset = self.image_to_subset[info.image_key]
-                if (
-                    subset.keep_tokens_separator
-                    and subset.keep_tokens_separator in info.caption
-                ):
-                    original_captions[info.image_key] = info.caption
-                    parts = info.caption.split(subset.keep_tokens_separator)
-                    all_tokens = []
-                    for part in parts:
-                        all_tokens.extend(
-                            token.strip()
-                            for token in part.split(subset.caption_separator)
-                            if token.strip()
-                        )
-                    info.caption = f"{subset.caption_separator} ".join(all_tokens)
-
-            try:
-                caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
-            finally:
-                for info in batch:
-                    if info.image_key in original_captions:
-                        info.caption = original_captions[info.image_key]
+            infos = [info for info, _ in batch]
+            captions_list = [captions for _, captions in batch]
+            if multi_candidates:
+                caching_strategy.cache_batch_outputs_multi(tokenize_strategy, models, text_encoding_strategy, infos, captions_list)
+            else:
+                # each image has exactly one candidate here (checked above)
+                captions = [captions[0] for captions in captions_list]
+                caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, infos, captions)
 
     def new_cache_text_encoder_outputs_variants(
         self, num_variants: int, models: List[Any], accelerator: Accelerator
@@ -1197,7 +1311,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     getattr(self, "seed", 0), info.absolute_path, variant_idx
                 )
                 with _temporary_random_seed(seed):
-                    caption, _ = self.process_caption(
+                    caption = self.process_caption(
                         subset,
                         info.caption,
                         info.caption_nl,
@@ -1514,7 +1628,7 @@ class BaseDataset(torch.utils.data.Dataset):
             flippeds.append(flipped)
 
             # captionとtext encoder outputを処理する
-            caption = image_info.caption  # default
+            caption = None
 
             tokenization_required = (
                 self.text_encoder_output_caching_strategy is None or self.text_encoder_output_caching_strategy.is_partial
@@ -1523,37 +1637,52 @@ class BaseDataset(torch.utils.data.Dataset):
             input_ids = None
             caption_debug = None
 
-            if image_info.text_encoder_outputs is not None:
-                # cached
-                text_encoder_outputs = image_info.text_encoder_outputs
-            elif image_info.text_encoder_outputs_npz is not None:
-                # on disk: select this epoch's pre-generated caption variant when enabled
-                if (
-                    self.text_encoder_output_caching_strategy is not None
-                    and self.text_encoder_output_caching_strategy.num_variants > 0
-                    and hasattr(self.text_encoder_output_caching_strategy, "get_variant_outputs_npz_path")
-                ):
-                    variant_idx = self.current_epoch % self.text_encoder_output_caching_strategy.num_variants
-                    npz_path = self.text_encoder_output_caching_strategy.get_variant_outputs_npz_path(
-                        image_info.absolute_path, variant_idx
+            caching_strategy = self.text_encoder_output_caching_strategy
+            if image_info.text_encoder_outputs_npz is not None and caching_strategy.num_variants > 0:
+                # on disk with caption variants: use this epoch's variant. its caption is reproduced with the same seed
+                variant_idx = self.current_epoch % caching_strategy.num_variants
+                npz_path = caching_strategy.get_variant_outputs_npz_path(image_info.absolute_path, variant_idx)
+                text_encoder_outputs = caching_strategy.load_outputs_npz(npz_path)
+                seed = _caption_variant_seed(getattr(self, "seed", 0), image_info.absolute_path, variant_idx)
+                with _temporary_random_seed(seed):
+                    caption, caption_debug = self.process_caption_with_debug(
+                        subset, image_info.caption, image_info.caption_nl, skip_caption_dropout=True
                     )
+            elif image_info.text_encoder_outputs is not None or image_info.text_encoder_outputs_npz is not None:
+                # cached (in memory or on disk): choose one caption candidate at each step, same as process_caption.
+                # the number of candidates matches the cache (checked when caching, see is_disk_cached_outputs_expected)
+                cached_captions = self.process_caption_candidates_for_cache(subset, image_info.caption)
+                candidate_index = random.randrange(len(cached_captions)) if len(cached_captions) > 1 else 0
+                caption = cached_captions[candidate_index]  # same as the cached outputs
+
+                if image_info.text_encoder_outputs is not None:
+                    # in memory: a list of outputs per candidate if the strategy supports multiple candidates
+                    if self.text_encoder_output_caching_strategy.supports_multiple_caption_candidates:
+                        text_encoder_outputs = image_info.text_encoder_outputs[candidate_index]
+                    else:
+                        text_encoder_outputs = image_info.text_encoder_outputs
                 else:
-                    npz_path = image_info.text_encoder_outputs_npz
-                text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(npz_path)
+                    # on disk
+                    if self.text_encoder_output_caching_strategy.supports_multiple_caption_candidates:
+                        text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
+                            image_info.text_encoder_outputs_npz, candidate_index
+                        )
+                    else:
+                        text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
+                            image_info.text_encoder_outputs_npz
+                        )
             else:
                 tokenization_required = True
             text_encoder_outputs_list.append(text_encoder_outputs)
 
             if tokenization_required:
-                caption, caption_debug = self.process_caption(
+                caption, caption_debug = self.process_caption_with_debug(
                     subset, image_info.caption, image_info.caption_nl
                 )
                 input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
-            elif self.log_captions_every_n_steps > 0:
-                # Cached embeddings still need a processed caption for diagnostics.
-                caption, caption_debug = self.process_caption(
-                    subset, image_info.caption, image_info.caption_nl
-                )
+            elif self.log_captions_every_n_steps > 0 and caption_debug is None:
+                # cached outputs without variants: the caption is the encoded one, no tag processing at this step
+                caption_debug = {"caption_mode": "tags", "dropped_tags": []}
 
             input_ids_list.append(input_ids)
             captions.append(caption)
@@ -1777,8 +1906,15 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def is_latent_cacheable(self) -> bool:
         return all([dataset.is_latent_cacheable() for dataset in self.datasets])
 
-    def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False) -> bool:
-        return all([dataset.is_text_encoder_output_cacheable(cache_supports_dropout) for dataset in self.datasets])
+    def is_text_encoder_output_cacheable(
+        self, cache_supports_dropout: bool = False, supports_multiple_caption_candidates: bool = False
+    ) -> bool:
+        return all(
+            [
+                dataset.is_text_encoder_output_cacheable(cache_supports_dropout, supports_multiple_caption_candidates)
+                for dataset in self.datasets
+            ]
+        )
 
     def set_current_strategies(self):
         for dataset in self.datasets:
@@ -1863,8 +1999,11 @@ def debug_dataset(train_dataset, show_input_ids=False):
                     im = np.transpose(im, (1, 2, 0))  # c,H,W -> H,W,c
                     im = im[:, :, ::-1]  # RGB -> BGR (OpenCV)
 
-                    if "conditioning_images" in example or "masked_images" in example:
-                        cond_img = example["conditioning_images"][j] if "conditioning_images" in example else example["masked_images"][j]
+                    cond_imgs = example.get("conditioning_images")
+                    if cond_imgs is None:
+                        cond_imgs = example.get("masked_images")
+                    if cond_imgs is not None:
+                        cond_img = cond_imgs[j]
                         logger.info(f"conditioning image size: {cond_img.size()}")
                         cond_img = ((cond_img.numpy() + 1.0) * 127.5).astype(np.uint8)
                         cond_img = np.transpose(cond_img, (1, 2, 0))

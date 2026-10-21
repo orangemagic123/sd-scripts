@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from safetensors.torch import save_file
 
+from library.custom_offloading_utils import BlockSwapConfig
 from library.flux_train_utils import get_noisy_model_input_and_timesteps
 from library.krea2_models import SingleMMDiTConfig, SingleStreamDiT, gather_valid_text
 from library.dataset import BaseDataset
@@ -45,6 +46,49 @@ def _tiny_config(*, layers: int = 1) -> SingleMMDiTConfig:
         txtheads=2,
         txtkvheads=1,
     )
+
+
+def _tiny_dit_inputs(config: SingleMMDiTConfig, device: torch.device):
+    image_tokens = torch.randn(1, 4, config.channels * config.patch**2, device=device, requires_grad=True)
+    text_tokens = torch.randn(1, 3, config.txtlayers, config.txtdim, device=device)
+    timesteps = torch.tensor([0.5], device=device)
+    positions = torch.zeros(1, 7, 3, device=device)
+    positions[0, :4, 1:] = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], device=device)
+    mask = torch.tensor([[True, True, True, True, True, True, False]], device=device)
+    return image_tokens, text_tokens, timesteps, positions, mask
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("h2d_only", [False, True])
+def test_krea2_block_swap_matches_unswapped_model(h2d_only):
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    config = _tiny_config(layers=6)
+    reference = SingleStreamDiT(config, attn_mode="torch").train()
+    reference.requires_grad_(False)
+    reference.enable_gradient_checkpointing()
+    swapped = SingleStreamDiT(config, attn_mode="torch").train()
+    swapped.load_state_dict(reference.state_dict())
+    swapped.requires_grad_(False)
+    swapped.enable_gradient_checkpointing()
+    reference.to(device)
+
+    swapped.enable_block_swap(3, BlockSwapConfig(device, supports_backward=True, h2d_only=h2d_only))
+    swapped.move_to_device_except_swap_blocks(device)
+    swapped.prepare_block_swap_before_forward()
+
+    for _ in range(2):  # the second step reuses the offloader state after a full forward/backward
+        results = []
+        for model in (reference, swapped):
+            torch.manual_seed(1)
+            image_tokens, *inputs = _tiny_dit_inputs(config, device)
+            output = model(image_tokens, *inputs)
+            output.square().mean().backward()
+            results.append((output.detach(), image_tokens.grad))
+        torch.cuda.synchronize()
+        (reference_output, reference_grad), (swapped_output, swapped_grad) = results
+        assert torch.allclose(reference_output, swapped_output, atol=1e-5, rtol=1e-5)
+        assert torch.allclose(reference_grad, swapped_grad, atol=1e-5, rtol=1e-5)
 
 
 def test_gather_valid_text_compacts_interior_padding():
@@ -423,6 +467,8 @@ def test_krea2_cache_pass_encodes_the_processed_caption():
         caption_dropout_rate=0.0,
         caption_dropout_every_n_epochs=0,
         enable_wildcard=False,
+        enable_multiline_caption=False,
+        multiline_caption_separator="---===---",
         shuffle_caption=False,
         token_warmup_step=0,
         token_warmup_min=1,
@@ -451,6 +497,7 @@ def test_krea2_cache_pass_encodes_the_processed_caption():
     dataset.current_step = 0
     dataset.max_train_steps = 100
     dataset.protected_tags_cache = {}
+    dataset.has_multiple_caption_candidates = False
 
     accelerator = SimpleNamespace(num_processes=1, process_index=0)
     with (
@@ -498,7 +545,7 @@ def test_krea2_text_cache_builds_independent_caption_variant_files(tmp_path):
         patch.object(
             dataset,
             "process_caption",
-            side_effect=[("first variant", {}), ("second variant", {})],
+            side_effect=["first variant", "second variant"],
         ),
     ):
         dataset.new_cache_text_encoder_outputs_variants(2, [Encoder()], accelerator)

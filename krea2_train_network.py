@@ -9,6 +9,7 @@ import torch.nn as nn
 from accelerate import Accelerator
 from einops import rearrange
 
+from library.custom_offloading_utils import BlockSwapConfig
 from library.device_utils import clean_memory_on_device, init_ipex
 
 init_ipex()
@@ -248,8 +249,14 @@ class Krea2NetworkTrainer(train_network.NetworkTrainer):
             disable_mmap=args.disable_mmap_load_safetensors,
         )
         if self.is_swapping_blocks:
-            logger.info(f"Enabling Krea 2 block swap: blocks_to_swap={args.blocks_to_swap}")
-            model.enable_block_swap(args.blocks_to_swap, accelerator.device)
+            # The base weights are frozen in LoRA training. Freeze them here, before enabling block swap, for the H2D-only offloader.
+            model.requires_grad_(False)
+            swap_config = BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
+            logger.info(
+                f"Enabling Krea 2 block swap: blocks_to_swap={args.blocks_to_swap}, H2D-only: {swap_config.h2d_only}, "
+                f"use pinned memory: {swap_config.use_pinned_memory}"
+            )
+            model.enable_block_swap(args.blocks_to_swap, swap_config)
         return model, text_encoders
 
     def get_tokenize_strategy(self, args):
