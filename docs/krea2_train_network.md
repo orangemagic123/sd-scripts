@@ -164,6 +164,7 @@ Krea 2 RAW is large. The following options can be combined according to availabl
 
 - `--gradient_checkpointing`: recompute activations during backward to reduce VRAM use.
 - `--blocks_to_swap=N`: offload main DiT blocks between CPU and GPU. `N` may be at most **26** because two of the 28 main blocks must remain resident.
+- `--block_swap_h2d_only`: with `--blocks_to_swap`, keep the frozen base weights on the CPU and copy them only Host→Device, which is faster than the classic block swap. Requires `--gradient_checkpointing`. See [Block Swap](./block_swap.md).
 - `--fp8_base --fp8_scaled`: enable Krea 2's scaled-fp8 base-weight path.
 
 For Krea 2, plain `--fp8_base` without `--fp8_scaled` is invalid because normalization and modulation parameters must not be cast to unscaled fp8. Scaled fp8 is applied to the heavy main-block linear weights while sensitive components remain in bf16.

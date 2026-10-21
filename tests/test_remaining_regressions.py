@@ -87,7 +87,7 @@ def test_caption_variants_are_stable_across_partial_rebuilds(monkeypatch):
         self, subset, caption, caption_nl, skip_caption_dropout=False
     ):
         suffix = f"{random.choice(subset.options)}-{random.randrange(1_000_000)}"
-        return f"{caption}|{suffix}", {}
+        return f"{caption}|{suffix}"
 
     dataset.process_caption = MethodType(process_caption, dataset)
     accelerator = SimpleNamespace(num_processes=1, process_index=0)
@@ -119,6 +119,70 @@ def test_caption_variants_are_stable_across_partial_rebuilds(monkeypatch):
             infos[0].absolute_path, variant_idx
         )
         assert strategy.saved[path].startswith("updated caption|")
+
+
+class _LoadableVariantCache(_VariantCache):
+    supports_multiple_caption_candidates = False
+
+    def __init__(self):
+        super().__init__()
+        self.loaded = []
+
+    def load_outputs_npz(self, npz_path):
+        self.loaded.append(npz_path)
+        return [np.zeros((2, 4), dtype=np.float32)]
+
+
+def test_getitem_returns_the_caption_of_the_epoch_variant(monkeypatch):
+    strategy = _LoadableVariantCache()
+    monkeypatch.setattr(TokenizeStrategy, "_strategy", object())
+    monkeypatch.setattr(TextEncodingStrategy, "_strategy", object())
+    monkeypatch.setattr(TextEncoderOutputsCachingStrategy, "_strategy", strategy)
+
+    dataset = BaseDataset((8, 8), 1.0, False, False)
+    dataset.batch_size = 1
+    dataset.seed = 12345
+    dataset.prior_loss_weight = 1.0
+    subset = SimpleNamespace(
+        custom_attributes={},
+        flip_aug=False,
+        enable_multiline_caption=False,
+        enable_wildcard=False,
+        caption_prefix=None,
+        caption_suffix=None,
+        caption_dropout_rate=0.0,
+        caption_dropout_every_n_epochs=0,
+        caption_tag_dropout_rate=0.0,
+        shuffle_caption=True,
+        token_warmup_min=1,
+        token_warmup_step=0,
+        keep_tokens=0,
+        keep_tokens_separator="",
+        caption_separator=",",
+        secondary_separator=None,
+        caption_mode="tags",
+    )
+    info = ImageInfo("image", 1, "a, b, c, d, e, f", False, "/dataset/image.png")
+    info.latents = torch.zeros(4, 1, 1)
+    info.latents_original_size = (8, 8)
+    info.latents_crop_ltrb = (0, 0, 0, 0)
+    info.alpha_mask = None
+    info.bucket_reso = (8, 8)
+    dataset.subsets = [subset]
+    dataset.register_image(info, subset)
+    accelerator = SimpleNamespace(num_processes=1, process_index=0)
+    dataset.new_cache_text_encoder_outputs_variants(3, [object()], accelerator)
+    assert len(set(strategy.saved.values())) > 1  # the variants differ
+
+    dataset.text_encoder_output_caching_strategy = strategy
+    dataset.bucket_manager = SimpleNamespace(buckets=[["image"]])
+    dataset.buckets_indices = [BucketBatchIndex(0, 1, 0)]
+    for epoch in range(4):
+        dataset.current_epoch = epoch
+        example = dataset[0]
+        path = strategy.get_variant_outputs_npz_path(info.absolute_path, epoch % 3)
+        assert strategy.loaded[-1] == path
+        assert example["captions"] == [strategy.saved[path]]
 
 
 def _write_anima_cache(path, strategy, caption, *, include_identity):
@@ -211,7 +275,7 @@ def test_cached_latents_still_build_inpainting_inputs(tmp_path):
     dataset.buckets_indices = [BucketBatchIndex(0, 1, 0)]
     dataset._length = 1
     dataset.text_encoder_output_caching_strategy = SimpleNamespace(
-        is_partial=False, num_variants=0
+        is_partial=False, num_variants=0, supports_multiple_caption_candidates=False
     )
     dataset.random_mask = lambda size: Image.new("L", size, color=255)
 
@@ -221,6 +285,13 @@ def test_cached_latents_still_build_inpainting_inputs(tmp_path):
         alpha_mask=False,
         random_crop=False,
         color_aug=False,
+        enable_multiline_caption=False,
+        enable_wildcard=False,
+        caption_prefix=None,
+        caption_suffix=None,
+        keep_tokens_separator="",
+        caption_separator=",",
+        secondary_separator=None,
     )
     info = ImageInfo("image", 1, "caption", False, str(image_path))
     info.bucket_reso = (8, 8)

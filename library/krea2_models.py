@@ -26,7 +26,7 @@ from einops import rearrange, repeat
 from torch import Tensor
 
 from library.attention import AttentionParams, attention as common_attention
-from library.custom_offloading_utils import ModelOffloader
+from library.custom_offloading_utils import BlockSwapConfig, ModelOffloader, create_offloader
 
 
 def roundup(value: int, multiple: int, name: str = "value") -> int:
@@ -405,11 +405,11 @@ class SingleStreamDiT(nn.Module):
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
 
-    def enable_block_swap(self, num_blocks: int, device: torch.device):
+    def enable_block_swap(self, num_blocks: int, config: BlockSwapConfig):
         if num_blocks > len(self.blocks) - 2:
             raise ValueError(f"Cannot swap more than {len(self.blocks) - 2} Krea 2 blocks; requested {num_blocks}")
         self.blocks_to_swap = num_blocks
-        self.offloader = ModelOffloader(self.blocks, num_blocks, device)
+        self.offloader = create_offloader("block", self.blocks, len(self.blocks), num_blocks, config)
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         if self.blocks_to_swap:
@@ -461,6 +461,8 @@ class SingleStreamDiT(nn.Module):
             self.attn_mode, self.split_attn, img_len, txt_mask
         )
         freqs = self.posemb(pos)
+        # NOTE: the block inputs must be passed positionally. The block swap offloader relies on full backward hooks, which
+        # PyTorch fires only after the block's backward if a *positional* input requires grad (see LoRAStreamOffloader).
         for index, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(index)
@@ -471,6 +473,6 @@ class SingleStreamDiT(nn.Module):
             else:
                 combined = block(combined, time_vec, freqs, attn_params)
             if self.blocks_to_swap:
-                self.offloader.submit_move_blocks(self.blocks, index)
+                self.offloader.submit_move_blocks_forward(self.blocks, index)
 
         return self.last(combined, time_embed)[:, :img_len]

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from library.dataset import BaseDataset, BucketManager
+from library.subset import DEFAULT_MULTILINE_CAPTION_SEPARATOR
 
 
 def _dataset():
@@ -23,6 +24,8 @@ def _subset(**overrides):
         "keep_tokens_separator": "|||",
         "secondary_separator": None,
         "enable_wildcard": False,
+        "enable_multiline_caption": False,
+        "multiline_caption_separator": DEFAULT_MULTILINE_CAPTION_SEPARATOR,
         "caption_dropout_rate": 0.0,
         "caption_dropout_every_n_epochs": 0,
         "caption_tag_dropout_rate": 0.0,
@@ -40,7 +43,7 @@ def _subset(**overrides):
 
 
 def test_keep_tokens_separator_is_removed_without_augmentation_and_uses_comma_space():
-    caption, debug_info = _dataset().process_caption(
+    caption, debug_info = _dataset().process_caption_with_debug(
         _subset(),
         "fixed_one, fixed_two|||flex_one,flex_two|||suffix",
     )
@@ -58,7 +61,7 @@ def test_flex_dropout_keeps_fixed_and_protected_flex_tags(tmp_path):
         protected_tags_file=str(protected_tags_file),
     )
 
-    caption, debug_info = _dataset().process_caption(
+    caption, debug_info = _dataset().process_caption_with_debug(
         subset,
         "fixed|||flex_drop, flex_keep",
     )
@@ -75,7 +78,7 @@ def test_special_dropout_only_drops_unprotected_fixed_tokens(tmp_path):
         protected_tags_file=str(protected_tags_file),
     )
 
-    caption, debug_info = _dataset().process_caption(
+    caption, debug_info = _dataset().process_caption_with_debug(
         subset,
         "fixed_drop, fixed_keep|||flex_survives|||suffix_drop",
     )
@@ -98,7 +101,7 @@ def test_mixed_caption_one_hot_weights_select_each_mode(selected_mode, expected_
     weights[selected_mode] = 1
     subset = _subset(caption_mode="mixed", mixed_weights=weights)
 
-    caption, debug_info = _dataset().process_caption(
+    caption, debug_info = _dataset().process_caption_with_debug(
         subset,
         "fixed|||tag_a, tag_b",
         "a natural description",
@@ -114,7 +117,7 @@ def test_mixed_caption_all_zero_weights_fall_back_to_tags():
         mixed_weights={"tags": 0, "nl": 0, "tags_nl": 0, "nl_tags": 0},
     )
 
-    caption, debug_info = _dataset().process_caption(
+    caption, debug_info = _dataset().process_caption_with_debug(
         subset,
         "fixed|||tag_a, tag_b",
         "a natural description",
