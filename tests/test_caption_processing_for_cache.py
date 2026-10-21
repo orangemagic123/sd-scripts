@@ -13,7 +13,8 @@ import numpy as np
 import pytest
 import torch
 
-from library.dataset import BaseDataset, BucketBatchIndex, ImageInfo
+from library.controlnet_dataset import ControlNetDataset
+from library.dataset import BaseDataset, BucketBatchIndex, DatasetGroup, ImageInfo
 from library.strategy_base import TextEncoderOutputsCachingStrategy, TextEncodingStrategy, TokenizeStrategy
 from library.subset import DEFAULT_MULTILINE_CAPTION_SEPARATOR
 
@@ -201,6 +202,40 @@ def test_cacheable_with_multiple_candidates_only_if_supported(caplog):
     # the other restrictions still apply
     ds.subsets = [make_subset(enable_multiline_caption=True, shuffle_caption=True)]
     assert BaseDataset.is_text_encoder_output_cacheable(ds, supports_multiple_caption_candidates=True) is False
+
+
+@pytest.mark.parametrize(
+    "dropout_rate,multiple_candidates,cache_options,expected",
+    [
+        pytest.param(0.0, False, {}, True, id="plain-caption"),
+        pytest.param(0.25, False, {}, False, id="dropout-unsupported"),
+        pytest.param(0.25, False, {"cache_supports_dropout": True}, True, id="dropout-supported"),
+        pytest.param(0.0, True, {}, False, id="multiple-candidates-unsupported"),
+        pytest.param(0.0, True, {"supports_multiple_caption_candidates": True}, True, id="multiple-candidates-supported"),
+        pytest.param(
+            0.25,
+            True,
+            {"cache_supports_dropout": True, "supports_multiple_caption_candidates": True},
+            True,
+            id="both-supported",
+        ),
+    ],
+)
+def test_controlnet_group_checks_delegate_cacheability(dropout_rate, multiple_candidates, cache_options, expected):
+    delegate = make_dataset()
+    delegate.subsets = [make_subset(caption_dropout_rate=dropout_rate, enable_multiline_caption=multiple_candidates)]
+    delegate.has_multiple_caption_candidates = multiple_candidates
+    delegate._length = 1
+
+    # Exercise the real group and delegate checks without loading training images.
+    controlnet = ControlNetDataset.__new__(ControlNetDataset)
+    controlnet.dreambooth_dataset_delegate = delegate
+    controlnet.image_data = {}
+    controlnet.num_train_images = 1
+    controlnet.num_reg_images = 0
+    group = DatasetGroup([controlnet])
+
+    assert group.is_text_encoder_output_cacheable(**cache_options) is expected
 
 
 # ---------------------------------------------------------------------------

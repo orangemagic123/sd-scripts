@@ -185,8 +185,13 @@ class ControlNetDataset(BaseDataset):
         self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager
         self.buckets_indices = self.dreambooth_dataset_delegate.buckets_indices
 
-    def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False):
-        return self.dreambooth_dataset_delegate.is_text_encoder_output_cacheable(cache_supports_dropout)
+    def is_text_encoder_output_cacheable(
+        self, cache_supports_dropout: bool = False, supports_multiple_caption_candidates: bool = False
+    ):
+        return self.dreambooth_dataset_delegate.is_text_encoder_output_cacheable(
+            cache_supports_dropout=cache_supports_dropout,
+            supports_multiple_caption_candidates=supports_multiple_caption_candidates,
+        )
 
     def new_cache_latents(self, model: Any, accelerator: Accelerator):
         return self.dreambooth_dataset_delegate.new_cache_latents(model, accelerator)
