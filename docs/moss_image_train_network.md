@@ -88,6 +88,7 @@ The following files are required before starting training:
 * The bucket resolutions must be multiples of 16 (`bucket_reso_steps` of 16, 32, 64, ... The default 64 is fine).
 * MOSS-Image is trained with long natural-language captions written by an LLM. `enable_multiline_caption = true` in the dataset config lets you use captions that contain line breaks as they are. See [the dataset config documentation](./config_README-en.md#captions-with-line-breaks-and-multiple-caption-candidates-enable_multiline_caption--true).
 * Multiple caption candidates for one image (separator lines with `enable_multiline_caption`, e.g. an original caption and recaptions of different lengths, as in the official training) can be used together with `--cache_text_encoder_outputs`: all candidates are encoded and stored in one cache file, and one of them is chosen randomly at each step. The cache size and the caching time are multiplied by the number of candidates.
+* MOSS JSON captions (`caption_format = "moss_json"`, one JSON per image with `caption.short` / `medium` / `long`, `tags` and `keep_tags`, compatible with ai-toolkit) can also be cached: every enabled variant and length is cached as a candidate and chosen with `mixed_weights` / `caption_length_weights` at each step. See [MOSS JSON captions](./config_README-en.md#moss-json-captions-caption_format--moss_json).
 
 <details>
 <summary>日本語</summary>
@@ -111,6 +112,7 @@ The following files are required before starting training:
 * bucket の解像度は 16 の倍数である必要があります（`bucket_reso_steps` は 16、32、64 など。デフォルトの 64 で問題ありません）。
 * MOSS-Image は LLM が書いた長い自然文のキャプションで学習されています。データセット設定で `enable_multiline_caption = true` を指定すると、改行を含むキャプションをそのまま使用できます。[データセット設定のドキュメント](./config_README-ja.md) を参照してください。
 * 一つの画像に対する複数のキャプション候補（`enable_multiline_caption` の区切り行。公式の学習のように元のキャプションと長さの異なる再キャプションを用意する場合など）は、`--cache_text_encoder_outputs` と併用できます。全候補をエンコードして一つのキャッシュファイルに保存し、ステップごとにランダムに一つを選びます。キャッシュのサイズとキャッシュ時間は候補数倍になります。
+* MOSS JSON キャプション（`caption_format = "moss_json"`。画像ごとの JSON で `caption.short` / `medium` / `long`、`tags`、`keep_tags` を持つ、ai-toolkit 互換の形式）もキャッシュできます。有効なバリエーションと長さをすべて候補としてキャッシュし、ステップごとに `mixed_weights` / `caption_length_weights` に従って選びます。[MOSS JSON キャプション](./config_README-en.md#moss-json-captions-caption_format--moss_json)を参照してください。
 
 </details>
 
@@ -592,7 +594,7 @@ To check how the above settings actually affect the sampled timesteps, two featu
 
 #### Caption Dropout
 
-Caption dropout uses the `caption_dropout_rate` setting from the dataset configuration (per-subset in TOML). When using `--cache_text_encoder_outputs`, the unconditional embedding (the encoded empty prompt) is stored in every cache file and the dropout is applied at training time, so caption dropout is compatible with text encoder output caching and the rate can be changed without regenerating the cache. The official pipeline uses the empty prompt as the default negative prompt for CFG, so caption dropout is useful if you plan to use CFG with an empty negative prompt.
+Caption dropout uses the `caption_dropout_rate` setting from the dataset configuration (per-subset in TOML). When using `--cache_text_encoder_outputs`, the unconditional embedding (the encoded empty prompt) is stored in every cache file and the dropout is applied at training time, so caption dropout is compatible with text encoder output caching and the rate can be changed without regenerating the cache. The dropout of each sample is decided with the current `caption_dropout_rate` and `caption_dropout_every_n_epochs` (the rate stored in the cache file is not used). The official pipeline uses the empty prompt as the default negative prompt for CFG, so caption dropout is useful if you plan to use CFG with an empty negative prompt.
 
 <details>
 <summary>日本語</summary>
@@ -633,7 +635,7 @@ Caption dropout uses the `caption_dropout_rate` setting from the dataset configu
 
 #### キャプションドロップアウト
 
-キャプションドロップアウトにはデータセット設定（TOML でのサブセット単位）の `caption_dropout_rate` を使用します。`--cache_text_encoder_outputs` 使用時は、unconditional の埋め込み（空のプロンプトのエンコード結果）が各キャッシュファイルに保存され、ドロップアウトは学習時に適用されます。このため、テキストエンコーダー出力のキャッシュと同時に使用でき、率を変更してもキャッシュの再生成は不要です。公式パイプラインは CFG のデフォルトの negative prompt として空のプロンプトを使うため、空の negative prompt で CFG を使う予定があればキャプションドロップアウトが有効です。
+キャプションドロップアウトにはデータセット設定（TOML でのサブセット単位）の `caption_dropout_rate` を使用します。`--cache_text_encoder_outputs` 使用時は、unconditional の埋め込み（空のプロンプトのエンコード結果）が各キャッシュファイルに保存され、ドロップアウトは学習時に適用されます。このため、テキストエンコーダー出力のキャッシュと同時に使用でき、率を変更してもキャッシュの再生成は不要です。各サンプルのドロップアウトは現在の `caption_dropout_rate` と `caption_dropout_every_n_epochs` で決まります（キャッシュファイルに保存された率は使用しません）。公式パイプラインは CFG のデフォルトの negative prompt として空のプロンプトを使うため、空の negative prompt で CFG を使う予定があればキャプションドロップアウトが有効です。
 
 </details>
 

@@ -392,6 +392,17 @@ class TextEncoderOutputsCachingStrategy:
         """
         return False
 
+    @property
+    def caches_caption_dropout_rate(self) -> bool:
+        """True if the last element of the cached outputs is the caption dropout rate, which the trainer applies to each
+        sample with ``random.random() < rate`` (``drop_cached_text_encoder_outputs``).
+
+        The dataset then decides the dropout of each sample at each step with the current subset settings
+        (``caption_dropout_rate`` and ``caption_dropout_every_n_epochs``) and replaces the rate with 1.0 (dropped) or
+        0.0. So the rate stored in a reused cache file is not used, and the caption log shows the dropout.
+        """
+        return False
+
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         raise NotImplementedError
 

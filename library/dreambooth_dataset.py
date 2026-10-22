@@ -19,6 +19,7 @@ from library.dataset import (
     glob_images,
     split_train_val,
 )
+from library.moss_json_caption import load_moss_caption_texts, parse_moss_caption_text
 from library.strategy_base import LatentsCachingStrategy
 from library.subset import DreamBoothSubset
 from library.utils import setup_logging
@@ -131,6 +132,11 @@ class DreamBoothDataset(BaseDataset):
                 return [], [], []
 
             info_cache_file = os.path.join(subset.image_dir, self.IMAGE_INFO_CACHE_FILE)
+            # MOSS JSON captions contain the natural language captions, `_nl` caption files are not used
+            caption_format = getattr(subset, "caption_format", "text")
+            is_moss_json = caption_format == "moss_json"
+            uses_nl_caption = subset.caption_mode == "mixed" and not is_moss_json
+
             use_cached_info_for_subset = subset.cache_info
             if use_cached_info_for_subset:
                 logger.info(
@@ -144,9 +150,20 @@ class DreamBoothDataset(BaseDataset):
                     use_cached_info_for_subset = False
 
             if use_cached_info_for_subset:
-                # json: {`img_path`:{"caption": "caption...", "resolution": [width, height]}, ...}
+                # json: {`img_path`:{"caption": "caption...", "resolution": [width, height], "caption_format": "text"}, ...}
+                # (caches of previous versions have no caption_format)
                 with open(info_cache_file, "r", encoding="utf-8") as f:
                     metas = json.load(f)
+                # the cached captions are the contents of the caption files of the format. a cache without
+                # caption_format may contain text or MOSS JSON captions, so it is read again once
+                if any(meta.get("caption_format") != caption_format for meta in metas.values()):
+                    logger.warning(
+                        f"caption_format of the cached image info is not recorded or differs from {caption_format}: captions are read again and the cache is updated"
+                        + f" / キャッシュされた画像情報の caption_format が記録されていないか {caption_format} と異なるため、キャプションを読み直してキャッシュを更新します: {info_cache_file}"
+                    )
+                    use_cached_info_for_subset = False
+
+            if use_cached_info_for_subset:
                 img_paths = list(metas.keys())
                 sizes: List[Optional[Tuple[int, int]]] = [meta["resolution"] for meta in metas.values()]
 
@@ -233,7 +250,7 @@ class DreamBoothDataset(BaseDataset):
             logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
 
             if use_cached_info_for_subset:
-                if subset.caption_mode == "mixed":
+                if uses_nl_caption:
                     captions = [
                         (metas[img_path].get("caption"), metas[img_path].get("caption_nl"))
                         for img_path in img_paths
@@ -250,6 +267,8 @@ class DreamBoothDataset(BaseDataset):
                         for img_path, caption in zip(img_paths, captions)
                         if caption is None or caption == ""
                     ]
+            elif is_moss_json:
+                captions = None  # read below
             else:
                 # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
                 captions = []
@@ -259,36 +278,45 @@ class DreamBoothDataset(BaseDataset):
                         img_path, subset.caption_extension, subset.enable_wildcard, subset.enable_multiline_caption
                     )
                     cap_for_img_nl = None
-                    if subset.caption_mode == "mixed":
+                    if uses_nl_caption:
                         # natural language caption: `<image>_nl<caption_extension>`, first line only
                         cap_for_img_nl = read_caption(img_path, "_nl" + subset.caption_extension, False)
                     if cap_for_img is None and subset.class_tokens is None:
                         logger.warning(
                             f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
                         )
-                        captions.append(("", cap_for_img_nl) if subset.caption_mode == "mixed" else "")
+                        captions.append(("", cap_for_img_nl) if uses_nl_caption else "")
                         missing_captions.append(img_path)
                     else:
                         if cap_for_img is None:
                             captions.append(
                                 (subset.class_tokens, cap_for_img_nl)
-                                if subset.caption_mode == "mixed"
+                                if uses_nl_caption
                                 else subset.class_tokens
                             )
                             missing_captions.append(img_path)
                         else:
                             captions.append(
                                 (cap_for_img, cap_for_img_nl)
-                                if subset.caption_mode == "mixed"
+                                if uses_nl_caption
                                 else cap_for_img
                             )
 
-            tag_frequency_captions = [
-                caption[0] if isinstance(caption, tuple) else caption for caption in captions
-            ]
+            if is_moss_json:
+                # the JSON text is kept as the caption and parsed when the caption is processed. every image needs a
+                # valid JSON: raises ValueError listing all missing, unreadable or invalid files
+                captions = load_moss_caption_texts(img_paths, subset.caption_extension, captions)
+                missing_captions = []
+                tag_frequency_captions = [
+                    parse_moss_caption_text(caption).tag_caption(subset.caption_separator) for caption in captions
+                ]
+            else:
+                tag_frequency_captions = [
+                    caption[0] if isinstance(caption, tuple) else caption for caption in captions
+                ]
 
             # validate separator lines of multi-line captions (raises ValueError if invalid)
-            self.validate_caption_candidates(subset, tag_frequency_captions)
+            self.validate_caption_candidates(subset, captions if is_moss_json else tag_frequency_captions)
 
             self.set_tag_frequency(
                 os.path.basename(subset.image_dir), tag_frequency_captions
@@ -321,6 +349,7 @@ class DreamBoothDataset(BaseDataset):
                         }
                     else:
                         matas[img_path] = {"caption": caption, "resolution": list(size)}
+                    matas[img_path]["caption_format"] = caption_format
                 with open(info_cache_file, "w", encoding="utf-8") as f:
                     json.dump(matas, f, ensure_ascii=False, indent=2)
                 logger.info(f"cache image info done for / 画像情報を出力しました : {info_cache_file}")

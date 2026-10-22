@@ -50,7 +50,9 @@ from transformers import CLIPTokenizer
 
 import library.model_util as model_util
 from library import accelerator_setup
+from library import moss_json_caption
 from library.device_utils import clean_memory_on_device
+from library.moss_json_caption import is_moss_json
 from library.strategy_base import (
     LatentsCachingStrategy,
     TextEncoderOutputsCachingStrategy,
@@ -662,7 +664,14 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def validate_caption_candidates(self, subset: BaseSubset, captions: Sequence[str]):
         """Validate separator lines of multi-line captions at loading time and record whether any image has
-        multiple candidates. Does nothing if ``enable_multiline_caption`` is disabled."""
+        multiple candidates. Does nothing if ``enable_multiline_caption`` is disabled.
+
+        With ``caption_format = "moss_json"`` the candidates are the caption variants (see
+        :meth:`moss_caption_candidates_for_cache`); the JSON must have been validated already."""
+        if is_moss_json(subset):
+            if any(len(self.moss_caption_candidates_for_cache(subset, caption)) > 1 for caption in captions):
+                self.has_multiple_caption_candidates = True
+            return
         if not subset.enable_multiline_caption:
             return
         for caption in captions:
@@ -678,7 +687,12 @@ class BaseDataset(torch.utils.data.Dataset):
         caption. The random processing (caption dropout, wildcard replacement, shuffling, tag dropout, token warmup) is
         not applied, because the cached outputs are shared by all steps. See :meth:`is_text_encoder_output_cacheable`
         for which of these are rejected or warned. ``keep_tokens_separator`` is removed, same as :meth:`process_caption`.
+
+        With ``caption_format = "moss_json"`` every enabled caption variant is returned, see
+        :meth:`moss_caption_candidates_for_cache`.
         """
+        if is_moss_json(subset):
+            return [text for _, text, _ in self.moss_caption_candidates_for_cache(subset, caption)]
         if subset.enable_multiline_caption:
             candidates = split_caption_candidates(caption, subset.multiline_caption_separator)
         elif subset.enable_wildcard:
@@ -699,6 +713,124 @@ class BaseDataset(torch.utils.data.Dataset):
         """The first (or only) processed caption candidate of :meth:`process_caption_candidates_for_cache`, for
         caching strategies without multiple candidate support."""
         return self.process_caption_candidates_for_cache(subset, caption)[0]
+
+    def choose_caption_candidate_for_cache(
+        self, subset: BaseSubset, caption: str
+    ) -> Tuple[int, str, Optional[Dict[str, Any]]]:
+        """Choose the caption candidate of the cached Text Encoder outputs at each step, same as :meth:`process_caption`.
+
+        Returns (candidate index, processed caption, caption debug info or None). The candidates of multi-line captions
+        are equally likely, the variants of MOSS JSON captions are chosen with their weights."""
+        if is_moss_json(subset):
+            candidates = self.moss_caption_candidates_for_cache(subset, caption)
+            weights = [weight for _, _, weight in candidates]
+            index = 0
+            if len(candidates) > 1 and sum(weights) > 0:
+                index = random.choices(range(len(candidates)), weights=weights, k=1)[0]
+            label, text, _ = candidates[index]
+            return index, text, {"caption_mode": label, "dropped_tags": []}
+
+        captions = self.process_caption_candidates_for_cache(subset, caption)
+        index = random.randrange(len(captions)) if len(captions) > 1 else 0
+        return index, captions[index], None
+
+    def _decide_cached_caption_dropout(self, subset: BaseSubset, text_encoder_outputs: Sequence) -> Tuple[List, bool]:
+        """Decide the caption dropout of cached Text Encoder outputs with the current subset settings, same as
+        :meth:`process_caption` (see ``TextEncoderOutputsCachingStrategy.caches_caption_dropout_rate``).
+
+        Returns the outputs with the cached rate (the last element) replaced by 1.0 if dropped or 0.0 otherwise, and
+        whether the sample is dropped."""
+        is_drop_out = (
+            subset.caption_dropout_every_n_epochs > 0
+            and self.current_epoch % subset.caption_dropout_every_n_epochs == 0
+        ) or (subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate)
+
+        value = 1.0 if is_drop_out else 0.0
+        if isinstance(text_encoder_outputs[-1], torch.Tensor):
+            rate = torch.tensor(value, dtype=torch.float32)
+        else:
+            rate = np.array(value, dtype=np.float32)
+        return list(text_encoder_outputs[:-1]) + [rate], is_drop_out
+
+    def _finalize_moss_caption(self, subset: BaseSubset, caption: str) -> str:
+        return apply_caption_replacements(subset, add_caption_prefix_suffix(subset, caption), self.replacements)
+
+    def moss_caption_candidates_for_cache(self, subset: BaseSubset, caption: str) -> List[Tuple[str, str, float]]:
+        """(label, processed caption, weight) of every caption that a MOSS JSON caption (the JSON text in
+        ``ImageInfo.caption``) produces without the random tag augmentation, in a fixed order: the enabled variants and
+        lengths, then the protected caption if ``protected_caption_dropout_rate`` > 0.
+
+        The full caption dropout is not a candidate: it is applied to the cached outputs at each step with
+        ``caption_dropout_rate``. The weights are relative and make the overall rates of the variants and the protected
+        caption the same as :meth:`process_caption`."""
+        moss_caption = moss_json_caption.parse_moss_caption_text(caption)
+        choices = moss_json_caption.get_choices(
+            moss_caption, subset.caption_mode, subset.mixed_weights, subset.caption_length_weights
+        )
+        protected_rate = subset.protected_caption_dropout_rate
+        normal_rate = max(0.0, 1.0 - subset.caption_dropout_rate - protected_rate)
+
+        candidates = []
+        for choice in choices:
+            text = moss_json_caption.render(
+                moss_caption, choice, moss_caption.keep_tags, moss_caption.tags, subset.caption_separator
+            )
+            candidates.append((choice.label, self._finalize_moss_caption(subset, text), normal_rate * choice.probability))
+        if protected_rate > 0:
+            text = moss_json_caption.render_protected(moss_caption, subset.keep_tokens, subset.caption_separator)
+            text = self._finalize_moss_caption(subset, text) if text else ""
+            candidates.append((moss_json_caption.PROTECTED_VARIANT, text, protected_rate))
+        return candidates
+
+    def _process_moss_caption_with_debug(
+        self, subset: BaseSubset, caption: str, skip_caption_dropout: bool
+    ) -> Tuple[str, Dict[str, Any]]:
+        """:meth:`process_caption_with_debug` for ``caption_format = "moss_json"``.
+
+        One random roll decides the full caption dropout (``caption_dropout_rate``) and the protected caption
+        (``protected_caption_dropout_rate``), so the two are exclusive. Otherwise a variant and a caption length are
+        chosen, and only the general tags are shuffled and dropped."""
+        moss_caption = moss_json_caption.parse_moss_caption_text(caption)
+        dropout_rate = subset.caption_dropout_rate
+        protected_rate = subset.protected_caption_dropout_rate
+
+        if skip_caption_dropout:
+            # the full caption dropout is applied later to the cached outputs: keep the overall protected rate
+            is_drop_out = False
+            is_protected = protected_rate > 0 and dropout_rate < 1 and random.random() < protected_rate / (1 - dropout_rate)
+        else:
+            roll = random.random() if dropout_rate > 0 or protected_rate > 0 else 1.0
+            is_drop_out = roll < dropout_rate or (
+                subset.caption_dropout_every_n_epochs > 0
+                and self.current_epoch % subset.caption_dropout_every_n_epochs == 0
+            )
+            is_protected = not is_drop_out and roll < dropout_rate + protected_rate
+
+        if is_drop_out:
+            return "", {"caption_mode": "dropout", "dropped_tags": []}
+        if is_protected:
+            text = moss_json_caption.render_protected(moss_caption, subset.keep_tokens, subset.caption_separator)
+            text = self._finalize_moss_caption(subset, text) if text else ""
+            return text, {"caption_mode": moss_json_caption.PROTECTED_VARIANT, "dropped_tags": []}
+
+        choice = moss_json_caption.choose(
+            moss_json_caption.get_choices(
+                moss_caption, subset.caption_mode, subset.mixed_weights, subset.caption_length_weights
+            )
+        )
+        has_tags = choice.variant != "nl"
+        special_dropout_rate = getattr(subset, "special_caption_tag_dropout_rate", 0.0) or 0.0
+        tag_dropout_rate = subset.caption_tag_dropout_rate if has_tags else 0.0
+        keep_tags, tags, dropped_tags = moss_json_caption.augment_tags(
+            moss_caption,
+            subset.keep_tokens,
+            subset.shuffle_caption and has_tags,
+            tag_dropout_rate,
+            special_dropout_rate,
+            self._get_protected_tags(subset) if tag_dropout_rate > 0 or special_dropout_rate > 0 else None,
+        )
+        text = moss_json_caption.render(moss_caption, choice, keep_tags, tags, subset.caption_separator)
+        return self._finalize_moss_caption(subset, text), {"caption_mode": choice.label, "dropped_tags": dropped_tags}
 
     def _get_protected_tags(self, subset: BaseSubset) -> set[str]:
         if not getattr(subset, "protected_tags_file", None):
@@ -829,6 +961,9 @@ class BaseDataset(torch.utils.data.Dataset):
         skip_caption_dropout: bool = False,
     ) -> Tuple[str, Dict[str, Any]]:
         """:meth:`process_caption` that also returns ``{"caption_mode": ..., "dropped_tags": [...]}`` for caption logging."""
+        if is_moss_json(subset):
+            return self._process_moss_caption_with_debug(subset, caption, skip_caption_dropout)
+
         debug_info = {"caption_mode": "tags", "dropped_tags": []}
         # select one caption from candidates. this must be done before adding prefix/suffix
         if subset.enable_multiline_caption:
@@ -1061,8 +1196,8 @@ class BaseDataset(torch.utils.data.Dataset):
         if self.has_multiple_caption_candidates:
             if not supports_multiple_caption_candidates:
                 logger.error(
-                    "Text Encoder outputs cannot be cached because some captions have multiple candidates (enable_multiline_caption with separator lines): one candidate is chosen randomly at each step"
-                    + " / 複数のキャプション候補を持つ画像があるため（enable_multiline_caption と区切り行）、Text Encoder の出力をキャッシュできません。候補はステップごとにランダムに選ばれます"
+                    "Text Encoder outputs cannot be cached because some captions have multiple candidates (enable_multiline_caption with separator lines, or caption variants of caption_format = moss_json): one candidate is chosen randomly at each step"
+                    + " / 複数のキャプション候補を持つ画像があるため（enable_multiline_caption と区切り行、または caption_format = moss_json のキャプションのバリエーション）、Text Encoder の出力をキャッシュできません。候補はステップごとにランダムに選ばれます"
                 )
                 return False
             logger.info(
@@ -1083,7 +1218,8 @@ class BaseDataset(torch.utils.data.Dataset):
                     or subset.token_warmup_step > 0
                     or subset.caption_tag_dropout_rate > 0
                     or getattr(subset, "special_caption_tag_dropout_rate", 0.0) > 0
-                    or getattr(subset, "caption_mode", "tags") == "mixed"
+                    # the mixed variants of MOSS JSON captions are cached as caption candidates
+                    or (getattr(subset, "caption_mode", "tags") == "mixed" and not is_moss_json(subset))
                 )
                 for subset in self.subsets
             ]
@@ -1212,8 +1348,8 @@ class BaseDataset(torch.utils.data.Dataset):
         if self.has_multiple_caption_candidates and not multi_candidates:
             # trainers check this in is_text_encoder_output_cacheable, but tools/cache_text_encoder_outputs.py does not
             raise ValueError(
-                "Text Encoder outputs cannot be cached because some captions have multiple candidates (enable_multiline_caption with separator lines) and this model does not support caching multiple candidates"
-                + " / 複数のキャプション候補を持つ画像があり（enable_multiline_caption と区切り行）、このモデルは複数候補のキャッシュに対応していないため、Text Encoder の出力をキャッシュできません"
+                "Text Encoder outputs cannot be cached because some captions have multiple candidates (enable_multiline_caption with separator lines, or caption variants of caption_format = moss_json) and this model does not support caching multiple candidates"
+                + " / 複数のキャプション候補を持つ画像があり（enable_multiline_caption と区切り行、または caption_format = moss_json のキャプションのバリエーション）、このモデルは複数候補のキャッシュに対応していないため、Text Encoder の出力をキャッシュできません"
             )
 
         # split by resolution
@@ -1651,9 +1787,9 @@ class BaseDataset(torch.utils.data.Dataset):
             elif image_info.text_encoder_outputs is not None or image_info.text_encoder_outputs_npz is not None:
                 # cached (in memory or on disk): choose one caption candidate at each step, same as process_caption.
                 # the number of candidates matches the cache (checked when caching, see is_disk_cached_outputs_expected)
-                cached_captions = self.process_caption_candidates_for_cache(subset, image_info.caption)
-                candidate_index = random.randrange(len(cached_captions)) if len(cached_captions) > 1 else 0
-                caption = cached_captions[candidate_index]  # same as the cached outputs
+                candidate_index, caption, caption_debug = self.choose_caption_candidate_for_cache(
+                    subset, image_info.caption
+                )  # caption is the same as the cached outputs
 
                 if image_info.text_encoder_outputs is not None:
                     # in memory: a list of outputs per candidate if the strategy supports multiple candidates
@@ -1673,6 +1809,16 @@ class BaseDataset(torch.utils.data.Dataset):
                         )
             else:
                 tokenization_required = True
+
+            if (
+                text_encoder_outputs is not None
+                and getattr(caching_strategy, "caches_caption_dropout_rate", False)
+                and not caching_strategy.is_partial
+            ):
+                text_encoder_outputs, is_drop_out = self._decide_cached_caption_dropout(subset, text_encoder_outputs)
+                if is_drop_out:
+                    caption = ""
+                    caption_debug = {"caption_mode": "dropout", "dropped_tags": []}
             text_encoder_outputs_list.append(text_encoder_outputs)
 
             if tokenization_required:

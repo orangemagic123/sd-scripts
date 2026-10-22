@@ -955,6 +955,16 @@ def add_dataset_arguments(
         " / キャプションモード: tags（既定）またはタグと自然言語を組み合わせるmixed",
     )
     parser.add_argument(
+        "--caption_format",
+        type=str,
+        default="text",
+        choices=["text", "moss_json"],
+        help="caption file format for DreamBooth datasets: text (default) or moss_json (one JSON per image with"
+        " caption.short/medium/long, tags and keep_tags; caption_extension defaults to .json)"
+        " / DreamBooth方式のキャプションファイル形式: text（既定）またはmoss_json（画像ごとのJSONで caption.short/medium/long、"
+        "tags、keep_tags を持つ。caption_extension の既定は .json）",
+    )
+    parser.add_argument(
         "--protected_tags_file",
         type=str,
         default=None,
@@ -1180,6 +1190,15 @@ def add_dataset_arguments(
             "Applied independently from caption_tag_dropout_rate; fixed tokens remain unshuffled"
             " / keep_tokens_separatorまたはkeep_tokensで固定したタグをdropoutする割合。"
             "caption_tag_dropout_rateとは独立に適用され、固定部分はシャッフルされません。",
+        )
+        parser.add_argument(
+            "--protected_caption_dropout_rate",
+            type=float,
+            default=0.0,
+            help="(caption_format=moss_json only) rate of training a sample with only keep_tags and the first keep_tokens tags,"
+            " without natural language. Exclusive with caption_dropout_rate (their sum must be at most 1)"
+            " / （caption_format=moss_jsonのみ）keep_tagsと先頭keep_tokens個のタグだけで学習する割合（自然言語なし）。"
+            "caption_dropout_rateとは排他で、合計は1以下",
         )
 
     if support_dreambooth:

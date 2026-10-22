@@ -9,6 +9,14 @@ sampling settings applied to it.
 import logging
 from typing import Any, Dict, Optional, Tuple, Union
 
+from library.moss_json_caption import (
+    CAPTION_FORMATS,
+    CAPTION_LENGTHS,
+    DEFAULT_MOSS_JSON_CAPTION_EXTENSION,
+    MIXED_CAPTION_VARIANTS,
+    normalize_weights,
+)
+
 DEFAULT_MULTILINE_CAPTION_SEPARATOR = "---===---"
 
 
@@ -56,6 +64,9 @@ class BaseSubset:
         resize_interpolation: Optional[str] = None,
         enable_multiline_caption: bool = False,
         multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
+        caption_format: str = "text",
+        caption_length_weights: Optional[Dict[str, float]] = None,
+        protected_caption_dropout_rate: float = 0.0,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -107,6 +118,63 @@ class BaseSubset:
 
         self.resize_interpolation = resize_interpolation
 
+        self.caption_format = caption_format or "text"
+        self.caption_length_weights = caption_length_weights
+        self.protected_caption_dropout_rate = float(protected_caption_dropout_rate or 0.0)
+        self._init_caption_format()
+
+    def _init_caption_format(self):
+        if self.caption_format not in CAPTION_FORMATS:
+            raise ValueError(f"caption_format must be one of {CAPTION_FORMATS}, got {self.caption_format!r}")
+
+        if self.caption_format != "moss_json":
+            if self.protected_caption_dropout_rate > 0:
+                raise ValueError(
+                    "protected_caption_dropout_rate can be used only with caption_format = 'moss_json'"
+                    + " / protected_caption_dropout_rate は caption_format = 'moss_json' でのみ使用できます"
+                )
+            if self.caption_length_weights is not None:
+                logger.warning(
+                    f"caption_length_weights is ignored for image_dir={self.image_dir}: it is used only with caption_format = 'moss_json'"
+                )
+            return
+
+        unsupported = [
+            name
+            for name, enabled in [
+                ("enable_wildcard", self.enable_wildcard),
+                ("enable_multiline_caption", self.enable_multiline_caption),
+                ("token_warmup_step", self.token_warmup_step),
+            ]
+            if enabled
+        ]
+        if unsupported:
+            raise ValueError(
+                f"caption_format = 'moss_json' cannot be used with {', '.join(unsupported)}"
+                + f" / caption_format = 'moss_json' は {', '.join(unsupported)} と併用できません"
+            )
+        if self.caption_mode not in ("tags", "mixed"):
+            raise ValueError(f"caption_mode must be 'tags' or 'mixed' for caption_format = 'moss_json', got {self.caption_mode!r}")
+
+        self.caption_length_weights = normalize_weights("caption_length_weights", self.caption_length_weights, CAPTION_LENGTHS)
+        if self.caption_mode == "mixed":
+            self.mixed_weights = normalize_weights("mixed_weights", self.mixed_weights, MIXED_CAPTION_VARIANTS)
+
+        if not 0.0 <= self.protected_caption_dropout_rate <= 1.0:
+            raise ValueError("protected_caption_dropout_rate must be between 0 and 1")
+        if self.protected_caption_dropout_rate > 0 and not (
+            0.0 <= self.caption_dropout_rate and self.caption_dropout_rate + self.protected_caption_dropout_rate <= 1.0
+        ):
+            raise ValueError("caption_dropout_rate + protected_caption_dropout_rate cannot exceed 1")
+
+        logger.info(
+            f"[subset init] image_dir={self.image_dir} caption_format=moss_json caption_mode={self.caption_mode}"
+            + (f" mixed_weights={self.mixed_weights}" if self.caption_mode == "mixed" else " (keep_tags + tags)")
+            + f" caption_length_weights={self.caption_length_weights}"
+            + f" caption_dropout_rate={self.caption_dropout_rate}"
+            + f" protected_caption_dropout_rate={self.protected_caption_dropout_rate}"
+        )
+
 
 class DreamBoothSubset(BaseSubset):
     def __init__(
@@ -145,6 +213,9 @@ class DreamBoothSubset(BaseSubset):
         resize_interpolation: Optional[str] = None,
         enable_multiline_caption: bool = False,
         multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
+        caption_format: str = "text",
+        caption_length_weights: Optional[Dict[str, float]] = None,
+        protected_caption_dropout_rate: float = 0.0,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -179,10 +250,16 @@ class DreamBoothSubset(BaseSubset):
             resize_interpolation=resize_interpolation,
             enable_multiline_caption=enable_multiline_caption,
             multiline_caption_separator=multiline_caption_separator,
+            caption_format=caption_format,
+            caption_length_weights=caption_length_weights,
+            protected_caption_dropout_rate=protected_caption_dropout_rate,
         )
 
         self.is_reg = is_reg
         self.class_tokens = class_tokens
+        if self.caption_format == "moss_json" and caption_extension in (None, "", ".caption"):
+            # ".caption" is the default of caption_extension, MOSS JSON captions are ".json" files
+            caption_extension = DEFAULT_MOSS_JSON_CAPTION_EXTENSION
         self.caption_extension = caption_extension
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension

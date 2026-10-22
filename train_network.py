@@ -68,12 +68,16 @@ logger = logging.getLogger(__name__)
 def _build_caption_metadata(train_dataset_group):
     caption_modes = []
     mixed_weights = []
+    caption_formats = []
 
     for dataset in getattr(train_dataset_group, "datasets", []):
         for subset in getattr(dataset, "subsets", []):
             caption_mode = getattr(subset, "caption_mode", None)
             if caption_mode is not None and caption_mode not in caption_modes:
                 caption_modes.append(caption_mode)
+            caption_format = getattr(subset, "caption_format", "text")
+            if caption_format not in caption_formats:
+                caption_formats.append(caption_format)
 
             if caption_mode == "mixed":
                 subset_mixed_weights = getattr(subset, "mixed_weights", None)
@@ -85,6 +89,8 @@ def _build_caption_metadata(train_dataset_group):
         metadata["ss_caption_mode"] = caption_modes[0] if len(caption_modes) == 1 else json.dumps(caption_modes)
     if mixed_weights:
         metadata["ss_mixed_weights"] = json.dumps(mixed_weights[0] if len(mixed_weights) == 1 else mixed_weights)
+    if "moss_json" in caption_formats:
+        metadata["ss_caption_format"] = caption_formats[0] if len(caption_formats) == 1 else json.dumps(caption_formats)
 
     return metadata
 
@@ -753,6 +759,10 @@ class NetworkTrainer:
                     }
                     if subset_metadata["caption_mode"] == "mixed":
                         subset_metadata["mixed_weights"] = getattr(subset, "mixed_weights", None)
+                    if getattr(subset, "caption_format", "text") == "moss_json":
+                        subset_metadata["caption_format"] = "moss_json"
+                        subset_metadata["caption_length_weights"] = subset.caption_length_weights
+                        subset_metadata["protected_caption_dropout_rate"] = subset.protected_caption_dropout_rate
 
                     image_dir_or_metadata_file = None
                     if subset.image_dir:
