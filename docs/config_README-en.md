@@ -191,6 +191,9 @@ Options related to the configuration of DreamBooth subsets.
 | `class_tokens` | `"sks girl"` | - | - | o |
 | `cache_info` | `false` | o | o | o |
 | `is_reg` | `false` | - | - | o |
+| `caption_format` | `"moss_json"` | o | o | o |
+| `caption_length_weights` | `{ short = 1, medium = 2, long = 7 }` | o | o | o |
+| `protected_caption_dropout_rate` | `0.08` | o | o | o |
 
 Firstly, note that for `image_dir`, the path to the image files must be specified as being directly in the directory. Unlike the previous DreamBooth method, where images had to be placed in subdirectories, this is not compatible with that specification. Also, even if you name the folder something like "5_cat", the number of repeats of the image and the class name will not be reflected. If you want to set these individually, you will need to explicitly specify them using `num_repeats` and `class_tokens`.
 
@@ -203,8 +206,11 @@ Firstly, note that for `image_dir`, the path to the image files must be specifie
 * `cache_info`
     * Specifies whether to cache the image size and caption. If not specified, it is set to `false`. The cache is saved in `metadata_cache.json` in `image_dir`.
     * Caching speeds up the loading of the dataset after the first time. It is effective when dealing with thousands of images or more.
+    * The cache records `caption_format`: when it is changed, or the cache was created by a previous version without it, the captions are read again and the cache is updated.
 * `is_reg`
     * Specifies whether the subset images are for normalization. If not specified, it is set to `false`, meaning that the images are not for normalization.
+* `caption_format`, `caption_length_weights`, `protected_caption_dropout_rate`
+    * `caption_format = "moss_json"` reads one MOSS JSON caption per image. See [MOSS JSON captions](#moss-json-captions-caption_format--moss_json).
 
 ### Fine-tuning method specific options
 
@@ -420,6 +426,58 @@ The same applies to metadata files (fine tuning method). Write a string containi
 ```
 
 In the prompt file for sample image generation (`--sample_prompts`), `\n` (backslash + n) in each line of a .txt file (and in string entries of a .json file) is converted to a line break. Dictionary entries of .toml / .json files can contain real line breaks, so they are not converted.
+
+### MOSS JSON captions: `caption_format = "moss_json"`
+
+DreamBooth subsets can read one JSON caption per image (`001.png` and `001.json`), compatible with ai-toolkit's `caption_format: moss_json`. `caption_extension` defaults to `.json` (unless another extension than `.caption` is specified). The command line option is `--caption_format moss_json`.
+
+```json
+{
+  "caption": {
+    "short": "A woman standing outdoors.",
+    "medium": "A black-haired woman in a white shirt stands in a garden.",
+    "long": "A black-haired woman in a white shirt stands in a garden, facing the viewer. Soft daylight illuminates her face."
+  },
+  "tags": ["1girl", "black hair", "white shirt", "outdoors", "garden"],
+  "keep_tags": ["mychar"],
+  "watermark": [],
+  "borders": ["none"]
+}
+```
+
+```toml
+[general]
+caption_format = "moss_json"
+caption_mode = "mixed"
+mixed_weights = { tags = 40, nl = 30, tags_nl = 20, nl_tags = 10 }
+caption_length_weights = { short = 10, medium = 20, long = 70 }
+caption_dropout_rate = 0.05
+protected_caption_dropout_rate = 0.08
+
+[[datasets]]
+resolution = 1024
+
+  [[datasets.subsets]]
+  image_dir = 'C:\dataset\images'
+  num_repeats = 2
+```
+
+* `caption.short` / `medium` / `long` are required non-empty strings. Line breaks and text in them are kept as they are. `tags` and `keep_tags` are optional arrays of strings. Duplicate tags are removed, and a tag listed in both arrays is kept only in `keep_tags`. Other fields such as `watermark` and `borders` are never added to the caption.
+* Every image needs a valid UTF-8 JSON file. All files are validated when the dataset is loaded, and all missing, unreadable or invalid files are listed together so that the training stops before it starts.
+* One variant is chosen for each sample. `keep_tags` always come first, in the written order:
+    * `tags`: keep_tags + tags
+    * `nl`: keep_tags + natural-language caption
+    * `tags_nl`: keep_tags + tags + natural-language caption
+    * `nl_tags`: keep_tags + natural-language caption + tags
+* `caption_mode = "mixed"` draws the variant with `mixed_weights` (the default is equal weights). With the default `caption_mode = "tags"` only the `tags` variant is used. For natural language only, use `caption_mode = "mixed"` with `mixed_weights = { nl = 1 }`. An image without `tags` always uses `nl`. `_nl` caption files are not used.
+* `caption_length_weights` sets the probabilities of the natural-language caption lengths (default: equal). The length is drawn independently of the variant and only for the variants with natural language.
+* The weights are relative and need not total 100. They must be finite and non-negative, with at least one positive value. A key omitted from a given mapping is zero, and a zero weight disables that choice.
+* `shuffle_caption`, `caption_tag_dropout_rate`, `keep_tokens` and `protected_tags_file` apply only to the general `tags`: the natural-language caption and `keep_tags` are never shuffled or dropped. The first `keep_tokens` general tags are neither shuffled nor dropped. `special_caption_tag_dropout_rate` drops `keep_tags` and those first general tags. `keep_tokens_separator` is not needed.
+* `caption_dropout_rate` replaces the whole caption with an empty caption. `protected_caption_dropout_rate` trains with only `keep_tags` and the first `keep_tokens` general tags, without the natural language. One random roll decides both, so they are exclusive and their sum must be at most 1.
+* `caption_prefix` / `caption_suffix` are added to the chosen caption (not to the empty caption of the dropout).
+* `enable_wildcard`, `enable_multiline_caption` and `token_warmup_step` cannot be used with `moss_json`.
+* Caching the Text Encoder outputs (`--cache_text_encoder_outputs`) is supported for MOSS-Image: every enabled variant and length (up to 10 captions per image, plus the protected caption) is cached in one file, and one of them is chosen with the configured weights at each step. The cache size and the caching time are multiplied by the number of these captions. `shuffle_caption` and `caption_tag_dropout_rate` cannot be used with the cache. The caption dropout of the cached outputs is decided at each step with the current `caption_dropout_rate` and `caption_dropout_every_n_epochs` (MOSS-Image and Anima), so changing them does not require re-caching. Other models can cache the outputs only if each image has a single caption (e.g. `caption_mode = "tags"` with one enabled length and no `protected_caption_dropout_rate`).
+* `--log_captions_every_n_steps` shows the chosen variant, e.g. `nl_tags:long`, `protected` or `dropout`.
 
 ### Example of configuration file : `secondary_separator`, wildcard notation, `keep_tokens_separator`, etc.
 

@@ -93,6 +93,9 @@ class DreamBoothSubsetParams(BaseSubsetParams):
     caption_extension: str = ".caption"
     cache_info: bool = False
     alpha_mask: bool = False
+    caption_format: str = "text"
+    caption_length_weights: Optional[Dict[str, float]] = None
+    protected_caption_dropout_rate: float = 0.0
 
 
 @dataclass
@@ -226,6 +229,9 @@ class ConfigSanitizer:
         "caption_extension": str,
         "class_tokens": str,
         "cache_info": bool,
+        "caption_format": Any("text", "moss_json"),
+        "caption_length_weights": dict,
+        "protected_caption_dropout_rate": Any(float, int),
     }
     DB_SUBSET_DISTINCT_SCHEMA = {
         Required("image_dir"): str,
@@ -595,7 +601,15 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                         is_reg: {subset.is_reg}
                         class_tokens: {subset.class_tokens}
                         caption_extension: {subset.caption_extension}
+                        caption_format: {subset.caption_format}
                     \n"""), "    ")
+                    if subset.caption_format == "moss_json":
+                        info += indent(dedent(f"""\
+                            caption_mode: {subset.caption_mode}
+                            mixed_weights: {subset.mixed_weights if subset.caption_mode == "mixed" else None}
+                            caption_length_weights: {subset.caption_length_weights}
+                            protected_caption_dropout_rate: {subset.protected_caption_dropout_rate}
+                        \n"""), "    ")
                 elif not is_controlnet:
                     info += indent(dedent(f"""\
                         metadata_file: {subset.metadata_file}
